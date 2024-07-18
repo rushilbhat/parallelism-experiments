@@ -2,10 +2,13 @@ import os
 import math
 import time
 import inspect
+from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from dataclasses import dataclass
+
+from distributed import CustomDDP
+# -----------------------------------------------------------------------------
 
 class CausalSelfAttention(nn.Module):
 
@@ -52,7 +55,6 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
-
 class Block(nn.Module):
 
     def __init__(self, config):
@@ -67,7 +69,6 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
-
 @dataclass
 class GPTConfig:
     block_size: int = 1024 # max sequence length
@@ -79,24 +80,23 @@ class GPTConfig:
 class GPT(nn.Module):
 
     def __init__(self, config):
-      super().__init__()
-      self.config = config
+        super().__init__()
+        self.config = config
 
-      self.transformer = nn.ModuleDict(dict(
-          wte = nn.Embedding(config.vocab_size, config.n_embd),
-          wpe = nn.Embedding(config.block_size, config.n_embd),
-          h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-          ln_f = nn.LayerNorm(config.n_embd),
-      ))
-      self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            wpe = nn.Embedding(config.block_size, config.n_embd),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ln_f = nn.LayerNorm(config.n_embd),
+        ))
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-      # weight sharing scheme
-      self.transformer.wte.weight = self.lm_head.weight
+        # weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight
 
-      # init params
-      self.apply(self._init_weights)
+        # init params
+        self.apply(self._init_weights)
 
-    #CHANGE: Shared weights reinitialised
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             std = 0.02
@@ -107,8 +107,7 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-    
-    
+
     def forward(self, idx, targets=None):
         # idx is of shape (B, T)
         B, T = idx.size()
@@ -128,7 +127,7 @@ class GPT(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
-        
+
     def configure_optimizers(self, weight_decay, learning_rate, device_type):
         # start with all of the candidate parameters (that require grad)
         param_dict = {pn: p for pn, p in self.named_parameters()}
@@ -154,9 +153,15 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
 
-
 # -----------------------------------------------------------------------------
 import tiktoken
+import numpy as np
+
+def load_tokens(filename):
+    npt = np.load(filename)
+    npt = npt.astype(np.int32) # added after video
+    ptt = torch.tensor(npt, dtype=torch.long)
+    return ptt
 
 class DataLoaderLite:
     def __init__(self, B, T, process_rank, num_processes):
@@ -188,7 +193,7 @@ class DataLoaderLite:
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
             self.current_position = self.B * self.T * self.process_rank
         return x, y
-    
+
 # -----------------------------------------------------------------------------
 # simple launch:
 # python train_gpt2.py
@@ -230,13 +235,12 @@ else:
 # added after video, pytorch can be serious about it's device vs. device_type distinction
 device_type = "cuda" if device.startswith("cuda") else "cpu"
 
-
 torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-B = 16 # micro batch size
+B = 16 # micro batch size CHANGE
 T = 1024 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -252,7 +256,7 @@ torch.set_float32_matmul_precision('high')
 model = GPT(GPTConfig(vocab_size=50304))
 # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
 model.to(device)
-use_compile = True # torch.compile interferes with HellaSwag eval and Generation. TODO fix
+use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
 if use_compile:
     model = torch.compile(model)
 if ddp:
@@ -261,8 +265,8 @@ raw_model = model.module if ddp else model # always contains the "raw" unwrapped
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 715
-max_steps = 19073 # 19,073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+warmup_steps = 10
+max_steps = 50
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
     if it < warmup_steps:
@@ -276,7 +280,7 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
     return min_lr + coeff * (max_lr - min_lr)
 
-
+# optimize!
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
 
 # create the log directory we will write checkpoints to and log to
@@ -293,7 +297,6 @@ for step in range(max_steps):
     model.train()
     optimizer.zero_grad()
     loss_accum = 0.0
-
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
@@ -309,7 +312,6 @@ for step in range(max_steps):
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
         loss.backward()
-
     if ddp:
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -331,7 +333,3 @@ for step in range(max_steps):
 
 if ddp:
     destroy_process_group()
-
-
-
-
