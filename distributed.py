@@ -1,3 +1,4 @@
+# distributed.py
 import torch
 import torch.distributed as dist
 
@@ -69,7 +70,7 @@ class CustomDDP(torch.nn.Module):
         for future, bucket in self.futures:
             future.wait()
             flat_grads = future.result()
-            flat_grads.div_(world_size)
+            flat_grads[0].div_(world_size)
             self._unflatten_and_copy(flat_grads, bucket)
         self.futures.clear()
 
@@ -77,14 +78,6 @@ class CustomDDP(torch.nn.Module):
         offset = 0
         for param in bucket.parameters:
             numel = param.numel()
-            param.grad = flat_grads[offset:offset+numel].view_as(param)
+            param.grad = flat_grads[0][offset:offset+numel].view_as(param)
             offset += numel
         bucket.reset()
-    
-
-
-
-
-
-
-
