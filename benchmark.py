@@ -7,7 +7,6 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-from distributed import CustomDDP
 # -----------------------------------------------------------------------------
 
 class CausalSelfAttention(nn.Module):
