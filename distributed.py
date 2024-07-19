@@ -25,6 +25,7 @@ class CustomDDP(torch.nn.Module):
         self.bucket_cap_mb = bucket_cap_mb
         self.buckets = []
         self.futures = []
+        self.require_backward_grad_sync = True
         self._create_buckets()
         self._register_hooks()
 
@@ -43,11 +44,11 @@ class CustomDDP(torch.nn.Module):
         
     def _create_hook(self, bucket, param):
         def hook(grad):
-            bucket.gradients.append(grad)
-            if len(bucket.gradients) == len(bucket.parameters):
-                self._reduce_bucket(bucket)
+            if self.require_backward_grad_sync:
+                bucket.gradients.append(grad)
+                if len(bucket.gradients) == len(bucket.parameters):
+                    self._reduce_bucket(bucket)
         return hook
-
 
     def _register_hooks(self):
         for bucket in self.buckets:
@@ -57,9 +58,12 @@ class CustomDDP(torch.nn.Module):
 
     def _reduce_bucket(self, bucket):
         flat_grads = torch.cat([grad.flatten() for grad in bucket.gradients])
-
         future = dist.all_reduce(flat_grads, group=self.process_group, async_op=True)
         self.futures.append((future, bucket))
+
+    def set_require_backward_grad_sync(self, require_sync):
+        self.require_backward_grad_sync = require_sync
+
     
     def forward(self, *args, **kwargs):
         return self.module(*args, **kwargs)
