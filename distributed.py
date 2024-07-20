@@ -9,9 +9,9 @@ class Bucket:
         self.size = 0 #in bytes
         self.grad_count = 0
 
-    def add_param(self, param):
-        self.parameters.append(param)
-        self.size += param.numel() * param.element_size()
+    def add_param(self, named_param):
+        self.parameters.append(named_param)
+        self.size += named_param[1].numel() * named_param[1].element_size()
 
     def reset(self):
         self.gradients.clear()
@@ -30,34 +30,36 @@ class CustomDDP(torch.nn.Module):
         self._register_hooks()
 
     def _create_buckets(self):
-        params = reversed(list(self.module.parameters()))
+        named_params = reversed(list(self.module.named_parameters()))
+                
         current_bucket = Bucket()
 
-        for param in params:
+        for name, param in named_params:
             if param.requires_grad:
-                param_size = param.numel() * param.element_size()
+                param_size = param.numel() * param.element_size() #using param_size as proxy for size of param.grad
                 if current_bucket.size + param_size > self.bucket_cap_mb * 1024 * 1024:
                     self.buckets.append(current_bucket)
                     current_bucket = Bucket()
-                current_bucket.add_param(param)
+                current_bucket.add_param((name,param))
         self.buckets.append(current_bucket)
         
-    def _create_hook(self, bucket, param):
+    def _create_hook(self, bucket, name, param):
         def hook(grad):
             if self.require_backward_grad_sync:
-                bucket.gradients.append(grad)
+                accumulated_grad = param.grad + grad
+                bucket.gradients.append((name, accumulated_grad))
                 if len(bucket.gradients) == len(bucket.parameters):
                     self._reduce_bucket(bucket)
         return hook
 
     def _register_hooks(self):
         for bucket in self.buckets:
-            for param in bucket.parameters:
-                hook = self._create_hook(bucket, param)
+            for name, param in bucket.parameters:
+                hook = self._create_hook(bucket, name, param)
                 param.register_hook(hook)
 
     def _reduce_bucket(self, bucket):
-        flat_grads = torch.cat([grad.flatten() for grad in bucket.gradients])
+        flat_grads = torch.cat([grad.flatten() for name, grad in bucket.gradients])
         future = dist.all_reduce(flat_grads, group=self.process_group, async_op=True)
         self.futures.append((future, bucket))
 
@@ -80,8 +82,11 @@ class CustomDDP(torch.nn.Module):
 
     def _unflatten_and_copy(self, flat_grads, bucket):
         offset = 0
-        for param in bucket.parameters:
-            numel = param.numel()
-            param.grad = flat_grads[0][offset:offset+numel].view_as(param)
-            offset += numel
+        for name1, grad in bucket.gradients:
+            numel = grad.numel()
+            for name2, param in bucket.parameters:
+                if name1 == name2:
+                    param.grad = flat_grads[0][offset:offset+numel].view_as(grad)
+                    offset += numel
+                    break
         bucket.reset()
