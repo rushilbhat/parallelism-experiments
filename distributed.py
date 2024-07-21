@@ -74,9 +74,8 @@ class CustomDDP(torch.nn.Module):
     
     def forward(self, *args, **kwargs):
         return self.module(*args, **kwargs)
-
-    def _finalize_backward(self):
-        # Wait for all asynchronous operations to complete
+    
+    def finalize_backward(self):
         world_size = dist.get_world_size(self.process_group)
         for future, bucket in self.futures:
             future.wait()

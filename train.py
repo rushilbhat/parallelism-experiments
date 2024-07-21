@@ -313,7 +313,7 @@ for step in range(max_steps):
             model.set_require_backward_grad_sync(micro_step == grad_accum_steps - 1)
         loss.backward()
     if ddp:
-        model._finalize_backward()
+        model.finalize_backward()
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     # determine and set the learning rate for this iteration
