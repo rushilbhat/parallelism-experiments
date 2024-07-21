@@ -4,14 +4,19 @@ import torch.distributed as dist
 
 class Bucket:
     def __init__(self):
-        self.parameters = []
-        self.gradients = []
+        self.parameters = {}
+        self.gradients = {}
         self.size = 0 #in bytes
         self.grad_count = 0
 
     def add_param(self, named_param):
-        self.parameters.append(named_param)
-        self.size += named_param[1].numel() * named_param[1].element_size()
+        name, param = named_param
+        self.parameters[name] = param
+        self.size += param.numel() * param.element_size()
+    
+    def add_grad(self, named_grad):
+        name, grad = named_grad
+        self.gradients[name] = grad
 
     def reset(self):
         self.gradients.clear()
@@ -47,19 +52,19 @@ class CustomDDP(torch.nn.Module):
         def hook(grad):
             if self.require_backward_grad_sync:
                 accumulated_grad = param.grad + grad
-                bucket.gradients.append((name, accumulated_grad))
+                bucket.add_grad((name, accumulated_grad))
                 if len(bucket.gradients) == len(bucket.parameters):
                     self._reduce_bucket(bucket)
         return hook
 
     def _register_hooks(self):
         for bucket in self.buckets:
-            for name, param in bucket.parameters:
+            for name, param in bucket.parameters.items():
                 hook = self._create_hook(bucket, name, param)
                 param.register_hook(hook)
 
     def _reduce_bucket(self, bucket):
-        flat_grads = torch.cat([grad.flatten() for name, grad in bucket.gradients])
+        flat_grads = torch.cat([grad.flatten() for grad in bucket.gradients.values()])
         future = dist.all_reduce(flat_grads, group=self.process_group, async_op=True)
         self.futures.append((future, bucket))
 
@@ -82,11 +87,10 @@ class CustomDDP(torch.nn.Module):
 
     def _unflatten_and_copy(self, flat_grads, bucket):
         offset = 0
-        for name1, grad in bucket.gradients:
+        for name, grad in bucket.gradients.items():
             numel = grad.numel()
-            for name2, param in bucket.parameters:
-                if name1 == name2:
-                    param.grad = flat_grads[0][offset:offset+numel].view_as(grad)
-                    offset += numel
-                    break
+            if name in bucket.parameters:
+                param = bucket.parameters[name]
+                param.grad = flat_grads[0][offset:offset+numel].view_as(grad)
+                offset += numel
         bucket.reset()
