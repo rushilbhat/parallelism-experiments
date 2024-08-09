@@ -107,19 +107,18 @@ class CustomFSDP(nn.Module):
         self.is_master = (rank == 0)
         self.fsdp_units = self._create_fsdp_units_for_gpt(self.module)
         self.shards = []
+        self.unsharded_fsdp_units = {}
 
         for fsdp_unit in self.fsdp_units:
             shard = self._create_and_shard_flat_param(fsdp_unit)
             self.shards.append(shard)
+        
 
-        import sys; sys.exit()
     def _create_fsdp_units_for_gpt(self, gpt_model):
         fsdp_units = []
 
         for block in gpt_model.transformer.h:
             fsdp_units.append(block)
-            if self.is_master: print([n for n,p in block.named_parameters()])
-
 
         remaining_params = nn.ModuleDict({
             "wte": gpt_model.transformer.wte,
@@ -136,30 +135,55 @@ class CustomFSDP(nn.Module):
         total_numel = sum(p.numel() for p in fsdp_unit.parameters())
         padded_size = math.ceil(total_numel / self.world_size) * self.world_size
         shard_size = padded_size // self.world_size
-
+        
         if self.is_master:
             flat_param = nn.Parameter(torch.empty(padded_size, device='cuda'))
-        
-            offset = 0
-            for name, param in fsdp_unit.named_parameters():
-                param_shape = param.shape
-                param_numel = param.numel()
-                param_view = flat_param.data[offset:offset+param.numel()].view(param_shape)
-                
-                name_parts = name.split('.')
-                module = fsdp_unit
-                for part in name_parts[:-1]:
-                    module = getattr(module, part)
-                setattr(module, name_parts[-1], nn.Parameter(param_view))
-                offset += param_numel
-
+            self._assign_params(fsdp_unit, flat_param)
             fsdp_unit.apply(self.param_init_fn)
             if padded_size > total_numel:
                 flat_param.data[total_numel:].zero_()
-            flat_param_shards = list(flat_param.chunk(self.world_size))            
-        
+            flat_param_shards = list(flat_param.chunk(self.world_size))       
+
         shard = torch.empty(shard_size, device='cuda')
         dist.scatter(shard, flat_param_shards if self.is_master else None, src=0)
         fsdp_unit.to('meta')
 
         return shard
+    
+    def _assign_params(self, fsdp_unit, flat_param):
+        all_params = dict(fsdp_unit.named_parameters(remove_duplicate=False))
+        unique_params = dict(fsdp_unit.named_parameters())
+
+        param_id_to_name = {id(param): name for name, param in unique_params.items()}
+        print(param_id_to_name)
+
+        if len(all_params) > len(unique_params):
+            shared_params = {}
+            for name, param in all_params.items():
+                unique_name = param_id_to_name.get(id(param))
+                if unique_name is not None and unique_name != name:
+                    shared_params[name] = unique_name
+
+        offset = 0
+        for name, param in unique_params.items():
+            param_shape = param.shape
+            param_numel = param.numel()
+            param_view = flat_param.data[offset:offset+param.numel()].view(param_shape)
+            
+            name_parts = name.split('.')
+            module = fsdp_unit
+            for part in name_parts[:-1]:
+                module = getattr(module, part)
+            setattr(module, name_parts[-1], nn.Parameter(param_view))
+            offset += param_numel
+        unique_params = dict(fsdp_unit.named_parameters())
+
+        for shared_name, unique_name in shared_params.items():
+            name_parts = shared_name.split('.')
+            module = fsdp_unit
+            for part in name_parts[:-1]:
+                module = getattr(module, part)
+            setattr(module, name_parts[-1], unique_params[unique_name])
+        
+        print([(n,id(p))for n,p in fsdp_unit.named_parameters(remove_duplicate=False)])
+
