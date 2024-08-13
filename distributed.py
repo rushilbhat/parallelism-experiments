@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 import math
-
+import gc
 
 class Bucket:
     def __init__(self):
@@ -101,7 +101,7 @@ class CustomFSDP(nn.Module):
     def __init__(self, module, param_init_fn, world_size, rank):
         super().__init__()
         self.module = module
-        self.param_init_fn = param_init_fn
+        self.param_init_fn = param_init_fn  
         self.world_size = world_size
         self.rank = rank
         self.is_master = (rank == 0)
@@ -113,20 +113,16 @@ class CustomFSDP(nn.Module):
             shard = self._create_and_shard_flat_param(fsdp_unit)
             self.shards.append(shard)
         
-
     def _create_fsdp_units_for_gpt(self, gpt_model):
         fsdp_units = []
-
         for block in gpt_model.transformer.h:
-            fsdp_units.append(block)
-
-        remaining_params = nn.ModuleDict({
-            "wte": gpt_model.transformer.wte,
-            "wpe": gpt_model.transformer.wpe,
-            "ln_f": gpt_model.transformer.ln_f,
-            "lm_head": gpt_model.lm_head
-        })
-        
+            fsdp_units.append(nn.ModuleList([block]))
+        remaining_params = nn.ModuleList([
+            gpt_model.transformer.wte, 
+            gpt_model.transformer.wpe, 
+            gpt_model.transformer.ln_f, 
+            gpt_model.lm_head
+        ])
         fsdp_units.append(remaining_params)
 
         return fsdp_units
@@ -137,28 +133,33 @@ class CustomFSDP(nn.Module):
         shard_size = padded_size // self.world_size
         
         if self.is_master:
-            flat_param = nn.Parameter(torch.empty(padded_size, device='cuda'))
-            self._assign_params(fsdp_unit, flat_param)
-            fsdp_unit.apply(self.param_init_fn)
-            if padded_size > total_numel:
-                flat_param.data[total_numel:].zero_()
-            flat_param_shards = list(flat_param.chunk(self.world_size))       
+            with torch.no_grad():
+                flat_param = nn.Parameter(torch.zeros(padded_size, device='cuda'))
+                self._assign_params(fsdp_unit, flat_param)            
+                fsdp_unit.apply(self.param_init_fn)
+                flat_param_shards = list(flat_param.chunk(self.world_size))   
 
         shard = torch.empty(shard_size, device='cuda')
         dist.scatter(shard, flat_param_shards if self.is_master else None, src=0)
-        fsdp_unit.to('meta')
+
+        if self.is_master:
+            flat_param_meta = nn.Parameter(torch.empty(padded_size, device='meta'))
+            self._assign_params(fsdp_unit, flat_param_meta)
+
+            del flat_param
+            del flat_param_shards
+            torch.cuda.empty_cache()
+            gc.collect()
 
         return shard
     
     def _assign_params(self, fsdp_unit, flat_param):
         all_params = dict(fsdp_unit.named_parameters(remove_duplicate=False))
         unique_params = dict(fsdp_unit.named_parameters())
-
         param_id_to_name = {id(param): name for name, param in unique_params.items()}
-        print(param_id_to_name)
-
+        
+        shared_params = {}
         if len(all_params) > len(unique_params):
-            shared_params = {}
             for name, param in all_params.items():
                 unique_name = param_id_to_name.get(id(param))
                 if unique_name is not None and unique_name != name:
@@ -169,7 +170,6 @@ class CustomFSDP(nn.Module):
             param_shape = param.shape
             param_numel = param.numel()
             param_view = flat_param.data[offset:offset+param.numel()].view(param_shape)
-            
             name_parts = name.split('.')
             module = fsdp_unit
             for part in name_parts[:-1]:
@@ -184,6 +184,4 @@ class CustomFSDP(nn.Module):
             for part in name_parts[:-1]:
                 module = getattr(module, part)
             setattr(module, name_parts[-1], unique_params[unique_name])
-        
-        print([(n,id(p))for n,p in fsdp_unit.named_parameters(remove_duplicate=False)])
 
