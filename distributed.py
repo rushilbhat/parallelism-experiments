@@ -97,65 +97,41 @@ class CustomDDP(nn.Module):
                 offset += numel
         bucket.reset()
 
-class CustomFSDP(nn.Module):
-    def __init__(self, module, param_init_fn, world_size, rank):
-        super().__init__()
-        self.module = module
-        self.param_init_fn = param_init_fn  
+
+class FSDPUnit:
+    def __init__(self, module_list, param_init_fn, world_size, rank):
+        self.module_list = module_list
         self.world_size = world_size
         self.rank = rank
         self.is_master = (rank == 0)
-        self.fsdp_units = self._create_fsdp_units_for_gpt(self.module)
-        self.shards = []
-        self.unsharded_fsdp_units = {}
+        self.shard = None
+        self.flat_param = None
+        self._create_and_shard_flat_param(param_init_fn)
 
-        for fsdp_unit in self.fsdp_units:
-            shard = self._create_and_shard_flat_param(fsdp_unit)
-            self.shards.append(shard)
-        
-    def _create_fsdp_units_for_gpt(self, gpt_model):
-        fsdp_units = []
-        for block in gpt_model.transformer.h:
-            fsdp_units.append(nn.ModuleList([block]))
-        remaining_params = nn.ModuleList([
-            gpt_model.transformer.wte, 
-            gpt_model.transformer.wpe, 
-            gpt_model.transformer.ln_f, 
-            gpt_model.lm_head
-        ])
-        fsdp_units.append(remaining_params)
+        torch.cuda.empty_cache()
+        gc.collect()
 
-        return fsdp_units
-    
-    def _create_and_shard_flat_param(self, fsdp_unit):
-        total_numel = sum(p.numel() for p in fsdp_unit.parameters())
+    def _create_and_shard_flat_param(self, param_init_fn):
+        total_numel = sum(p.numel() for p in self.module_list.parameters())
         padded_size = math.ceil(total_numel / self.world_size) * self.world_size
         shard_size = padded_size // self.world_size
+        self.shard = torch.empty(shard_size, device='cuda')
         
-        if self.is_master:
-            with torch.no_grad():
-                flat_param = nn.Parameter(torch.zeros(padded_size, device='cuda'))
-                self._assign_params(fsdp_unit, flat_param)            
-                fsdp_unit.apply(self.param_init_fn)
-                flat_param_shards = list(flat_param.chunk(self.world_size))   
+        with torch.no_grad():
+            if self.is_master:
+                self.flat_param = nn.Parameter(torch.zeros(padded_size, device='cuda'))
+                self._assign_params()
+                self.module_list.apply(param_init_fn)
+                flat_param_shards = list(self.flat_param.chunk(self.world_size))   
 
-        shard = torch.empty(shard_size, device='cuda')
-        dist.scatter(shard, flat_param_shards if self.is_master else None, src=0)
+            dist.scatter(self.shard, flat_param_shards if self.is_master else None, src=0)
+        
+        self.flat_param = nn.Parameter(self.shard)
+        self._assign_params()
 
-        if self.is_master:
-            flat_param_meta = nn.Parameter(torch.empty(padded_size, device='meta'))
-            self._assign_params(fsdp_unit, flat_param_meta)
-
-            del flat_param
-            del flat_param_shards
-            torch.cuda.empty_cache()
-            gc.collect()
-
-        return shard
-    
-    def _assign_params(self, fsdp_unit, flat_param):
-        all_params = dict(fsdp_unit.named_parameters(remove_duplicate=False))
-        unique_params = dict(fsdp_unit.named_parameters())
+    def _assign_params(self):
+        all_params = dict(self.module_list.named_parameters(remove_duplicate=False))
+        unique_params = dict(self.module_list.named_parameters())
         param_id_to_name = {id(param): name for name, param in unique_params.items()}
         
         shared_params = {}
@@ -165,23 +141,48 @@ class CustomFSDP(nn.Module):
                 if unique_name is not None and unique_name != name:
                     shared_params[name] = unique_name
 
+        is_sharded = self.flat_param.data_ptr() == self.shard.data_ptr()
         offset = 0
         for name, param in unique_params.items():
             param_shape = param.shape
             param_numel = param.numel()
-            param_view = flat_param.data[offset:offset+param.numel()].view(param_shape)
+            if is_sharded:
+                param_view = None
+            else:
+                param_view = self.flat_param.data[offset:offset+param.numel()].view(param_shape)
             name_parts = name.split('.')
-            module = fsdp_unit
+            module = self.module_list #clean up naming
             for part in name_parts[:-1]:
                 module = getattr(module, part)
             setattr(module, name_parts[-1], nn.Parameter(param_view))
             offset += param_numel
-        unique_params = dict(fsdp_unit.named_parameters())
 
+        unique_params = dict(self.module_list.named_parameters())
         for shared_name, unique_name in shared_params.items():
             name_parts = shared_name.split('.')
-            module = fsdp_unit
+            module = self.module_list
             for part in name_parts[:-1]:
                 module = getattr(module, part)
             setattr(module, name_parts[-1], unique_params[unique_name])
 
+
+class CustomFSDP(nn.Module):
+    def __init__(self, module, param_init_fn, world_size, rank):
+        super().__init__()
+        self.module = module
+        self.world_size = world_size
+        self.rank = rank
+        self.fsdp_units = self._create_fsdp_units_for_gpt(self.module, param_init_fn)
+        
+    def _create_fsdp_units_for_gpt(self, gpt_model, param_init_fn):
+        fsdp_units = []
+        for block in gpt_model.transformer.h:
+            fsdp_units.append(FSDPUnit(nn.ModuleList([block]), param_init_fn, self.world_size, self.rank))
+        remaining_params = nn.ModuleList([
+            gpt_model.transformer.wte, 
+            gpt_model.transformer.wpe, 
+            gpt_model.transformer.ln_f, 
+            gpt_model.lm_head
+        ])
+        fsdp_units.append(FSDPUnit(remaining_params, param_init_fn, self.world_size, self.rank))
+        return fsdp_units
