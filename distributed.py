@@ -106,10 +106,33 @@ class FSDPUnit:
         self.is_master = (rank == 0)
         self.shard = None
         self.flat_param = None
+        self.param_numels = []
+        self.param_shapes = []
+        self.param_names = []
+        self.shared_params = {}
+
+        self._record_param_metadata()
         self._create_and_shard_flat_param(param_init_fn)
 
         torch.cuda.empty_cache()
         gc.collect()
+
+    def _record_param_metadata(self):
+        all_params = dict(self.module_list.named_parameters(remove_duplicate=False))
+        unique_params = dict(self.module_list.named_parameters())
+        param_id_to_name = {id(param): name for name, param in unique_params.items()}
+        
+        if len(all_params) > len(unique_params):
+            for name, param in all_params.items():
+                unique_name = param_id_to_name.get(id(param))
+                if unique_name is not None and unique_name != name:
+                    self.shared_params[name] = unique_name
+
+        for n,p in unique_params.items():
+            self.param_numels.append(p.numel())
+            self.param_shapes.append(p.shape)
+            self.param_names.append(n)
+
 
     def _create_and_shard_flat_param(self, param_init_fn):
         total_numel = sum(p.numel() for p in self.module_list.parameters())
@@ -130,40 +153,32 @@ class FSDPUnit:
         self._assign_params()
 
     def _assign_params(self):
-        all_params = dict(self.module_list.named_parameters(remove_duplicate=False))
-        unique_params = dict(self.module_list.named_parameters())
-        param_id_to_name = {id(param): name for name, param in unique_params.items()}
-        
-        shared_params = {}
-        if len(all_params) > len(unique_params):
-            for name, param in all_params.items():
-                unique_name = param_id_to_name.get(id(param))
-                if unique_name is not None and unique_name != name:
-                    shared_params[name] = unique_name
-
         is_sharded = self.flat_param.data_ptr() == self.shard.data_ptr()
         offset = 0
-        for name, param in unique_params.items():
-            param_shape = param.shape
-            param_numel = param.numel()
+        for name, numel, shape in zip(self.param_names, self.param_numels, self.param_shapes):
             if is_sharded:
-                param_view = None
+                param_tensor = torch.empty(0, device='cuda')
             else:
-                param_view = self.flat_param.data[offset:offset+param.numel()].view(param_shape)
+                param_tensor = self.flat_param[offset:offset+numel].view(shape)
             name_parts = name.split('.')
             module = self.module_list #clean up naming
             for part in name_parts[:-1]:
                 module = getattr(module, part)
-            setattr(module, name_parts[-1], nn.Parameter(param_view))
-            offset += param_numel
+            param = getattr(module, name_parts[-1])
+            if param.device.type == 'meta':
+                setattr(module, name_parts[-1], nn.Parameter(param_tensor))
+            else:
+                param.data = param_tensor
+            offset += numel
 
         unique_params = dict(self.module_list.named_parameters())
-        for shared_name, unique_name in shared_params.items():
-            name_parts = shared_name.split('.')
-            module = self.module_list
-            for part in name_parts[:-1]:
-                module = getattr(module, part)
-            setattr(module, name_parts[-1], unique_params[unique_name])
+        if len(self.shared_params) > 0:
+            for duplicate, original in self.shared_params.items():
+                name_parts = duplicate.split('.')
+                module = self.module_list
+                for part in name_parts[:-1]:
+                    module = getattr(module, part)
+                setattr(module, name_parts[-1], unique_params[original])
 
 
 class CustomFSDP(nn.Module):
