@@ -99,7 +99,7 @@ class CustomDDP(nn.Module):
 
 
 class FSDPUnit:
-    def __init__(self, module_list, param_init_fn, world_size, rank):
+    def __init__(self, module_list, param_init_fn, world_size, rank, unit_name):
         self.module_list = module_list
         self.world_size = world_size
         self.rank = rank
@@ -110,12 +110,28 @@ class FSDPUnit:
         self.param_shapes = []
         self.param_names = []
         self.shared_params = {}
+        self.unit_name = unit_name
+        self.before_buffer = 0
+        self.after_buffer = 0
 
         self._record_param_metadata()
         self._create_and_shard_flat_param(param_init_fn)
 
         torch.cuda.empty_cache()
         gc.collect()
+        if self.is_master: self._measure_gpu_memory("After sharding flat_param")
+        
+        self._register_hooks()
+
+    def _measure_gpu_memory(self, stage, before_flag=False, after_flag=False):
+        torch.cuda.synchronize()
+        memory_allocated = torch.cuda.memory_allocated() / 1024**2  # Convert to MB
+        memory_reserved = torch.cuda.memory_reserved() / 1024**2  # Convert to MB
+        print(f"[Rank {self.rank}] {stage}:")
+        print(f"  Allocated: {memory_allocated:.2f} MB")
+        print(f"  Reserved:  {memory_reserved:.2f} MB")
+        if before_flag: self.before_buffer = memory_allocated
+        if after_flag: self.after_buffer = memory_allocated
 
     def _record_param_metadata(self):
         all_params = dict(self.module_list.named_parameters(remove_duplicate=False))
@@ -135,14 +151,17 @@ class FSDPUnit:
 
 
     def _create_and_shard_flat_param(self, param_init_fn):
-        total_numel = sum(p.numel() for p in self.module_list.parameters())
+        total_numel = sum(self.param_numels)
         padded_size = math.ceil(total_numel / self.world_size) * self.world_size
         shard_size = padded_size // self.world_size
+        if self.is_master: self._measure_gpu_memory("Before creating shard")
         self.shard = torch.empty(shard_size, device='cuda')
+        if self.is_master: self._measure_gpu_memory("After creating shard")
         
         with torch.no_grad():
             if self.is_master:
                 self.flat_param = nn.Parameter(torch.zeros(padded_size, device='cuda'))
+                if self.is_master: self._measure_gpu_memory("After creating flat_param")
                 self._assign_params()
                 self.module_list.apply(param_init_fn)
                 flat_param_shards = list(self.flat_param.chunk(self.world_size))   
@@ -180,6 +199,39 @@ class FSDPUnit:
                     module = getattr(module, part)
                 setattr(module, name_parts[-1], unique_params[original])
 
+    def _register_hooks(self):
+        def pre_forward_hook(module, input):
+            if self.flat_param.data_ptr() == self.shard.data_ptr(): #check if all shards have been gathered
+                if self.is_master: self._measure_gpu_memory(f"Before gathering unit {self.unit_name}", before_flag=True)
+                full_tensor = torch.empty(self.shard.numel() * self.world_size, device=self.shard.device)
+                if self.is_master: self._measure_gpu_memory(f"After creating full tensor for {self.unit_name}")
+                dist.all_gather_into_tensor(full_tensor, self.shard)
+                self.flat_param.data = full_tensor
+
+                self._assign_params()
+                if self.is_master: 
+                    self._measure_gpu_memory(f"After gathering unit {self.unit_name}", after_flag=True)
+                    print(f"Increase: {self.after_buffer - self.before_buffer}")
+
+
+                
+        def post_forward_hook(module, input, output):
+            if self.flat_param.data_ptr() != self.shard.data_ptr(): #check if flat_params is not sharded
+                if self.is_master: self._measure_gpu_memory(f"Before sharding unit {self.unit_name}", before_flag=True)
+                self.flat_param.data = self.shard.data
+                self._assign_params()
+
+                torch.cuda.empty_cache()
+                gc.collect()
+                if self.is_master: 
+                    self._measure_gpu_memory(f"After sharding unit {self.unit_name}", after_flag=True)
+                    print(f"Decrease: {self.before_buffer - self.after_buffer}")
+
+
+        for i, module in enumerate(self.module_list):
+            module.register_forward_pre_hook(pre_forward_hook)
+            if i == len(self.module_list) - 1: # Only add post-forward hook to the last module (wrt declared order, not logical order) 
+                module.register_forward_hook(post_forward_hook)
 
 class CustomFSDP(nn.Module):
     def __init__(self, module, param_init_fn, world_size, rank):
@@ -192,12 +244,16 @@ class CustomFSDP(nn.Module):
     def _create_fsdp_units_for_gpt(self, gpt_model, param_init_fn):
         fsdp_units = []
         for block in gpt_model.transformer.h:
-            fsdp_units.append(FSDPUnit(nn.ModuleList([block]), param_init_fn, self.world_size, self.rank))
+            fsdp_units.append(FSDPUnit(nn.ModuleList([block]), param_init_fn, self.world_size, self.rank, "block"))
         remaining_params = nn.ModuleList([
             gpt_model.transformer.wte, 
             gpt_model.transformer.wpe, 
             gpt_model.transformer.ln_f, 
             gpt_model.lm_head
         ])
-        fsdp_units.append(FSDPUnit(remaining_params, param_init_fn, self.world_size, self.rank))
+        fsdp_units.append(FSDPUnit(remaining_params, param_init_fn, self.world_size, self.rank, "remaining"))
         return fsdp_units
+    
+    def forward(self, *args, **kwargs):
+        output = self.module(*args, **kwargs)
+        return output
