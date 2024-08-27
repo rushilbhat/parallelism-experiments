@@ -161,6 +161,9 @@ class FSDPUnit:
                 self.flat_param = nn.Parameter(torch.zeros(padded_size, device='cuda'))
                 if self.is_master: self._measure_gpu_memory("After creating flat_param")
                 self._assign_params()
+                for m in self.module_list.modules():
+                    if len(list(m.children())) == 0 and hasattr(m, 'reset_parameters'): 
+                        m.reset_parameters() #doesn't break weight sharing scheme since it's an in place operation
                 self.module_list.apply(param_init_fn)
                 flat_param_shards = list(self.flat_param.chunk(self.world_size))   
 
