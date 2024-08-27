@@ -197,7 +197,7 @@ class FSDPUnit:
                     module = getattr(module, part)
                 setattr(module, name_parts[-1], unique_params[original])
 
-    def pre_forward_hook(self, module, input):
+    def gather_params(self):
         if self.flat_param.data_ptr() == self.shard.data_ptr(): #check if all shards have been gathered
             if self.is_master: self._measure_gpu_memory(f"Before gathering unit {self.unit_name}", before_flag=True)
             full_tensor = torch.empty(self.shard.numel() * self.world_size, device=self.shard.device)
@@ -212,7 +212,7 @@ class FSDPUnit:
 
 
             
-    def post_forward_hook(self, module, input, output):
+    def shard_params(self):
         if self.flat_param.data_ptr() != self.shard.data_ptr(): #check if flat_params is not sharded
             if self.is_master: self._measure_gpu_memory(f"Before sharding unit {self.unit_name}", before_flag=True)
             self.flat_param.data = self.shard.data
@@ -240,8 +240,8 @@ class CustomFSDP(nn.Module):
         for block in gpt_model.transformer.h:
             fsdp_units.append(FSDPUnit(nn.ModuleList([block]), param_init_fn, self.world_size, self.rank, "block"))
         remaining_params = nn.ModuleList([
-            gpt_model.transformer.wte, 
-            gpt_model.transformer.wpe, 
+            gpt_model.transformer.wpe,
+            gpt_model.transformer.wte,
             gpt_model.transformer.ln_f, 
             gpt_model.lm_head
         ])
@@ -251,13 +251,14 @@ class CustomFSDP(nn.Module):
     def _register_hooks(self):
         for i, unit in enumerate(self.fsdp_units):
             for j, module in enumerate(unit.module_list):
-                module.register_forward_pre_hook(unit.pre_forward_hook)
+                if j == 0:
+                    module.register_forward_pre_hook(lambda m, i, u=unit: u.gather_params())
                 # Only add post-forward hook to the last module in each unit except for the last fsdp unit 
                 # (wrt declared order, not logical order) 
                 # CHANGE
-                if j == len(unit.module_list)-1 and i != len(self.fsdp_units)-1: 
-                    module.register_forward_hook(unit.post_forward_hook)
-    
+                if j == len(unit.module_list)-1:
+                    module.register_forward_hook(lambda m, i, o, u=unit: u.shard_params())
+                
     def forward(self, *args, **kwargs):
         output = self.module(*args, **kwargs)
         return output
