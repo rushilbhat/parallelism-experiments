@@ -104,7 +104,7 @@ class FSDPUnit:
         self.world_size = world_size
         self.rank = rank
         self.is_master = (rank == 0)
-        self.shard = None
+        self.local_shard = None
         self.flat_param = None
         self.param_numels = []
         self.param_shapes = []
@@ -153,8 +153,8 @@ class FSDPUnit:
         padded_size = math.ceil(total_numel / self.world_size) * self.world_size
         shard_size = padded_size // self.world_size
         if self.is_master: self._measure_gpu_memory("Before creating shard")
-        self.shard = nn.Parameter(torch.empty(shard_size, device='cuda'))
-        self.shard.grad = torch.zeros_like(self.shard)
+        self.local_shard = nn.Parameter(torch.empty(shard_size, device='cuda'))
+        self.local_shard.grad = torch.zeros_like(self.local_shard)
         if self.is_master: self._measure_gpu_memory("After creating shard")
         
         with torch.no_grad():
@@ -162,7 +162,7 @@ class FSDPUnit:
                 self.flat_param = nn.Parameter(torch.zeros(padded_size, device='cuda'))
                 self.flat_param.grad = torch.zeros_like(self.flat_param)  
                 if self.is_master: self._measure_gpu_memory("After creating flat_param")
-                self._assign_params_and_grads()
+                self.update_module_params(include_grads=True)
                 for m in self.module_list.modules():
                     if len(list(m.children())) == 0 and hasattr(m, 'reset_parameters'): 
                         m.reset_parameters() #doesn't break weight sharing scheme since it's an in place operation
@@ -170,23 +170,23 @@ class FSDPUnit:
                 flat_param_shards = list(self.flat_param.chunk(self.world_size))
                 flat_grad_shards = list(self.flat_param.grad.chunk(self.world_size))
 
-            dist.scatter(self.shard.data, flat_param_shards if self.is_master else None, src=0)
-            dist.scatter(self.shard.grad, flat_grad_shards if self.is_master else None, src=0)
+            dist.scatter(self.local_shard.data, flat_param_shards if self.is_master else None, src=0)
+            dist.scatter(self.local_shard.grad, flat_grad_shards if self.is_master else None, src=0)
         
-        self.flat_param = nn.Parameter(self.shard)
-        self.flat_param.grad = self.shard.grad
-        self._assign_params_and_grads()
+        self.flat_param = nn.Parameter(self.local_shard)
+        self.flat_param.grad = self.local_shard.grad
+        self.update_module_params(include_grads=True)
 
-    def _assign_params_and_grads(self):
-        is_sharded = self.flat_param.data_ptr() == self.shard.data_ptr()
+    def update_module_params(self, include_grads):
+        is_sharded = self.flat_param.data_ptr() == self.local_shard.data_ptr()
         offset = 0
         for name, numel, shape in zip(self.param_names, self.param_numels, self.param_shapes):
             if is_sharded:
                 param_tensor = torch.empty(0, device='cuda')
-                grad_tensor = torch.empty(0, device='cuda')
+                grad_tensor = torch.empty(0, device='cuda') if include_grads else None
             else:
                 param_tensor = self.flat_param[offset:offset+numel].view(shape)
-                grad_tensor = self.flat_param.grad[offset:offset+numel].view(shape)
+                grad_tensor = self.flat_param.grad[offset:offset+numel].view(shape) if include_grads else None
             name_parts = name.split('.')
             module = self.module_list #clean up naming
             for part in name_parts[:-1]:
@@ -207,30 +207,34 @@ class FSDPUnit:
                     module = getattr(module, part)
                 setattr(module, name_parts[-1], unique_params[original])
 
-    def gather_params(self):
-        if self.flat_param.data_ptr() == self.shard.data_ptr(): #check if all shards have been gathered
+    def gather(self, include_grads=False, flag=False):
+        if self.flat_param.data_ptr() == self.local_shard.data_ptr(): #check if all shards have been gathered
             if self.is_master: self._measure_gpu_memory(f"Before gathering unit {self.unit_name}", before_flag=True)
-            full_tensor = torch.empty(self.shard.numel() * self.world_size, device=self.shard.device)
-            full_grads_tensor = torch.empty(self.shard.grad.numel() * self.world_size, device=self.shard.grad.device)
+            full_tensor = torch.empty(self.local_shard.numel() * self.world_size, device=self.local_shard.device)
             if self.is_master: self._measure_gpu_memory(f"After creating full tensor for {self.unit_name}")
-            dist.all_gather_into_tensor(full_tensor, self.shard)
-            dist.all_gather_into_tensor(full_grads_tensor, self.shard.grad)
+            dist.all_gather_into_tensor(full_tensor, self.local_shard)
             self.flat_param.data = full_tensor
-            self.flat_param.grad = full_grads_tensor
+            
+            if include_grads:
+                full_grads_tensor = torch.empty(self.local_shard.grad.numel() * self.world_size, device=self.local_shard.grad.device)
+                dist.all_gather_into_tensor(full_grads_tensor, self.local_shard.grad)
+                self.flat_param.grad = full_grads_tensor
 
-            self._assign_params_and_grads()
+            self.update_module_params(include_grads=include_grads)
             if self.is_master: 
                 self._measure_gpu_memory(f"After gathering unit {self.unit_name}", after_flag=True)
                 print(f"Increase: {self.after_buffer - self.before_buffer}")
 
 
             
-    def shard_params(self):
-        if self.flat_param.data_ptr() != self.shard.data_ptr(): #check if flat_params is not sharded
+    def shard(self, include_grads=False, flag=False):
+        if self.flat_param.data_ptr() != self.local_shard.data_ptr(): #check if flat_params is not sharded
             if self.is_master: self._measure_gpu_memory(f"Before sharding unit {self.unit_name}", before_flag=True)
-            self.flat_param.data = self.shard.data
-            self.flat_param.grad = self.shard.grad
-            self._assign_params_and_grads()
+            self.flat_param.data = self.local_shard.data
+            if include_grads:
+                self.flat_param.grad = self.local_shard.grad
+
+            self.update_module_params(include_grads=include_grads)
 
             torch.cuda.empty_cache()
             gc.collect()
@@ -266,12 +270,12 @@ class CustomFSDP(nn.Module):
         for i, unit in enumerate(self.fsdp_units):
             for j, module in enumerate(unit.module_list):
                 if j == 0:
-                    module.register_forward_pre_hook(lambda m, i, u=unit: u.gather_params())
+                    module.register_forward_pre_hook(lambda m, i, u=unit: u.gather())
                 # Only add post-forward hook to the last module in each unit except for the last fsdp unit 
                 # (wrt declared order, not logical order) 
                 # CHANGE
                 if j == len(unit.module_list)-1:
-                    module.register_forward_hook(lambda m, i, o, u=unit: u.shard_params())
+                    module.register_forward_hook(lambda m, i, o, u=unit: u.shard())
                 
     def forward(self, *args, **kwargs):
         output = self.module(*args, **kwargs)
