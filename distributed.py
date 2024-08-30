@@ -221,8 +221,8 @@ class FSDPUnit:
             self.flat_param.data = full_tensor
             
             if include_grads:
-                full_grads_tensor = torch.empty(self.local_shard.grad.numel() * self.world_size, device=self.local_shard.grad.device)
-                dist.all_gather_into_tensor(full_grads_tensor, self.local_shard.grad)
+                full_grads_tensor = torch.zeros(self.local_shard.grad.numel() * self.world_size, device=self.local_shard.grad.device)
+                # dist.all_gather_into_tensor(full_grads_tensor, self.local_shard.grad)
                 self.flat_param.grad = full_grads_tensor
 
             self.update_module_params(include_grads=include_grads)
