@@ -180,10 +180,15 @@ class FSDPUnit:
     def update_module_params(self, include_grads):
         is_sharded = self.flat_param.data_ptr() == self.local_shard.data_ptr()
         offset = 0
+        local_shard_size = self.local_shard.numel()
         for name, numel, shape in zip(self.param_names, self.param_numels, self.param_shapes):
             if is_sharded:
-                param_tensor = torch.empty(0, device='cuda')
-                grad_tensor = torch.empty(0, device='cuda') if include_grads else None
+                if offset < local_shard_size:
+                    param_tensor = self.local_shard[offset:min(offset+numel, local_shard_size)]
+                    grad_tensor = self.local_shard.grad[offset:min(offset+numel, local_shard_size)] if include_grads else None
+                else:
+                    param_tensor = torch.empty(0, device='cuda')
+                    grad_tensor = torch.empty(0, device='cuda') if include_grads else None
             else:
                 param_tensor = self.flat_param[offset:offset+numel].view(shape)
                 grad_tensor = self.flat_param.grad[offset:offset+numel].view(shape) if include_grads else None
