@@ -181,14 +181,17 @@ class FSDPUnit:
         is_sharded = self.flat_param.data_ptr() == self.local_shard.data_ptr()
         offset = 0
         local_shard_size = self.local_shard.numel()
+        offset = 0 - local_shard_size * self.rank if is_sharded else 0
         for name, numel, shape in zip(self.param_names, self.param_numels, self.param_shapes):
             if is_sharded:
-                if offset < local_shard_size:
-                    param_tensor = self.local_shard[offset:min(offset+numel, local_shard_size)]
-                    grad_tensor = self.local_shard.grad[offset:min(offset+numel, local_shard_size)] if include_grads else None
-                else:
+                if offset >= local_shard_size or offset + numel < 0:
                     param_tensor = torch.empty(0, device='cuda')
                     grad_tensor = torch.empty(0, device='cuda') if include_grads else None
+                else:
+                    start = max(offset, 0)
+                    end = min(offset+numel, local_shard_size)
+                    param_tensor = self.local_shard[start:end]
+                    grad_tensor = self.local_shard.grad[start:end] if include_grads else None
             else:
                 param_tensor = self.flat_param[offset:offset+numel].view(shape)
                 grad_tensor = self.flat_param.grad[offset:offset+numel].view(shape) if include_grads else None
