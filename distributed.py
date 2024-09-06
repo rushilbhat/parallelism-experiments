@@ -313,6 +313,29 @@ class CustomFSDP(torch.nn.Module):
             for name, param in unit.module_list.named_parameters():
                 param.register_post_accumulate_grad_hook(lambda p, u=unit, n=name: u.post_backward(n))
 
+    @torch.no_grad()
+    def clip_grad_norm(self, max_norm):
+        local_grad_norm = torch.linalg.vector_norm(
+            torch.stack(
+                [
+                    torch.linalg.vector_norm(p.grad, 2.0, dtype=torch.float32) 
+                    for p in self.module.parameters()
+                    if p.grad is not None
+                ]
+            ),
+            2.0,
+            dtype=torch.float32
+        )
+        sqaured_norm = local_grad_norm ** 2.0
+        dist.all_reduce(sqaured_norm) 
+        global_grad_norm = sqaured_norm ** (1.0 / 2.0)
+        clip_coef = max_norm / (global_grad_norm + 1e-6)
+        if clip_coef < 1.0:
+            for p in self.module.parameters():
+                if p.grad is not None:
+                    p.grad.mul_(clip_coef)
+        return global_grad_norm
+
     def forward(self, *args, **kwargs):
         output = self.module(*args, **kwargs)
         return output
