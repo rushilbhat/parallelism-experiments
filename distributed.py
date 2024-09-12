@@ -24,25 +24,18 @@ class Bucket:
     def reset(self):
         self.gradients.clear()
 
-
-class CustomDDP(nn.Module):
-    def __init__(self, module, process_group, bucket_cap_mb=25): 
-        super().__init__()
-        self.module = module
-        self.process_group = process_group
+class Reducer:
+    def __init__(self, named_params, bucket_cap_mb, world_size):
+        self.named_params = reversed(list(named_params))
         self.bucket_cap_mb = bucket_cap_mb
+        self.world_size = world_size
         self.buckets = []
         self.futures = []
-        self.require_backward_grad_sync = True
         self._create_buckets()
-        self._register_hooks()
 
     def _create_buckets(self):
-        named_params = reversed(list(self.module.named_parameters()))
-                
         current_bucket = Bucket()
-
-        for name, param in named_params:
+        for name, param in self.named_params:
             if param.requires_grad:
                 param_size = param.numel() * param.element_size() #using param_size as proxy for size of param.grad
                 if current_bucket.size + param_size > self.bucket_cap_mb * 1024 * 1024:
@@ -50,36 +43,22 @@ class CustomDDP(nn.Module):
                     current_bucket = Bucket()
                 current_bucket.add_param((name,param))
         self.buckets.append(current_bucket)
-        
-    def _create_hook(self, bucket, name, param):
-        def hook(grad):
-            if self.require_backward_grad_sync:
-                accumulated_grad = param.grad + grad
-                bucket.add_grad((name, accumulated_grad))
+
+    def add_grad(self, name, grad):
+        for bucket in self.buckets:
+            if name in bucket.parameters:
+                bucket.add_grad((name, grad))
                 if len(bucket.gradients) == len(bucket.parameters):
                     self._reduce_bucket(bucket)
-        return hook
-
-    def _register_hooks(self):
-        for bucket in self.buckets:
-            for name, param in bucket.parameters.items():
-                hook = self._create_hook(bucket, name, param)
-                param.register_hook(hook)
+                break
 
     def _reduce_bucket(self, bucket):
         flat_grads = torch.cat([grad.flatten() for grad in bucket.gradients.values()])
-        future = dist.all_reduce(flat_grads, group=self.process_group, async_op=True)
+        # future = dist.all_reduce(flat_grads, group=self.process_group, async_op=True)
+        future = dist.all_reduce(flat_grads, async_op=True)
         self.futures.append((future, bucket))
 
-    def set_require_backward_grad_sync(self, require_sync):
-        self.require_backward_grad_sync = require_sync
-
-    
-    def forward(self, *args, **kwargs):
-        return self.module(*args, **kwargs)
-    
-    def finalize_backward(self):
-        world_size = dist.get_world_size(self.process_group)
+    def finalize_backward(self, world_size):
         for future, bucket in self.futures:
             future.wait()
             flat_grads = future.result()
@@ -97,6 +76,37 @@ class CustomDDP(nn.Module):
                 offset += numel
         bucket.reset()
 
+class CustomDDP(nn.Module):
+    def __init__(self, module, process_group, bucket_cap_mb=25): 
+        super().__init__()
+        self.module = module
+        self.process_group = process_group
+        world_size = dist.get_world_size(self.process_group)
+        self.reducer = Reducer(self.module.named_pameters(), bucket_cap_mb, world_size)
+        self.require_backward_grad_sync = True
+        self._register_hooks()
+        
+    def _create_hook(self, name, param):
+        def hook(grad):
+            if self.require_backward_grad_sync:
+                accumulated_grad = param.grad + grad
+                self.reducer.add_grad(name, accumulated_grad)
+        return hook
+
+    def _register_hooks(self):
+        for name, param in self.module.named_parameters():
+            if param.requires_grad:
+                hook = self._create_hook(name, param)
+                param.register_hook(hook)
+
+    def set_require_backward_grad_sync(self, require_sync):
+        self.require_backward_grad_sync = require_sync
+
+    def forward(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
+    
+    def finalize_backward(self):
+        self.reducer.finalize_backward()
 
 class FSDPUnit:
     def __init__(self, module_list, param_init_fn, world_size, rank, unit_name):
