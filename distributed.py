@@ -273,10 +273,6 @@ class FSDPUnit:
                 self.flat_param.grad = self.local_shard.grad
 
             self.update_module_params(include_grads=include_grads)
-
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-            gc.collect()
             
             # if flag==True and self.is_master: print(f"Shard after backward through fsdp unit: {self.unit_name}")
 
