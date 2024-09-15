@@ -294,7 +294,7 @@ with open(log_file, "w") as f: # open for writing to clear the file
 for step in range(max_steps):
     t0 = time.time()
     last_step = (step == max_steps - 1)
-
+    
     model.train()
     optimizer.zero_grad()
     loss_accum = 0.0
@@ -313,7 +313,6 @@ for step in range(max_steps):
             model.set_require_backward_grad_sync(micro_step == grad_accum_steps - 1)
         loss.backward()
     if ddp:
-        model.finalize_backward()
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     # determine and set the learning rate for this iteration
