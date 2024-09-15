@@ -8,7 +8,6 @@ import gc
 class Bucket:
     def __init__(self):
         self.parameters = {}
-        self.gradients = {}
         self.size = 0 #in bytes
         self.grad_count = 0
 
@@ -16,13 +15,6 @@ class Bucket:
         name, param = named_param
         self.parameters[name] = param
         self.size += param.numel() * param.element_size()
-    
-    def add_grad(self, named_grad):
-        name, grad = named_grad
-        self.gradients[name] = grad
-
-    def reset(self):
-        self.gradients.clear()
 
 class Reducer:
     def __init__(self, named_params, bucket_cap_mb, world_size):
@@ -32,6 +24,9 @@ class Reducer:
         self.buckets = []
         self.futures = []
         self._create_buckets()
+        self._register_hooks()
+        self.require_backward_grad_sync = True
+        self.reduced_buckets_count = 0
 
     def _create_buckets(self):
         current_bucket = Bucket()
@@ -44,69 +39,67 @@ class Reducer:
                 current_bucket.add_param((name,param))
         self.buckets.append(current_bucket)
 
-    def add_grad(self, name, grad):
+    def _register_hooks(self):
         for bucket in self.buckets:
-            if name in bucket.parameters:
-                bucket.add_grad((name, grad))
-                if len(bucket.gradients) == len(bucket.parameters):
-                    self._reduce_bucket(bucket)
-                break
+            for param in bucket.parameters.values():
+                def hook(p, b=bucket):
+                    if self.require_backward_grad_sync:
+                        b.grad_count += 1
+                        if b.grad_count == len(b.parameters):
+                            self._reduce_bucket(b)
+                            if self.reduced_buckets_count == len(self.buckets):
+                                self.finalize_backward()
+
+                param.register_post_accumulate_grad_hook(hook)
 
     def _reduce_bucket(self, bucket):
-        flat_grads = torch.cat([grad.flatten() for grad in bucket.gradients.values()])
-        # future = dist.all_reduce(flat_grads, group=self.process_group, async_op=True)
+        flat_grads = torch.cat([param.grad.flatten() for param in bucket.parameters.values()])
         future = dist.all_reduce(flat_grads, async_op=True)
         self.futures.append((future, bucket))
+        self.reduced_buckets_count += 1
 
-    def finalize_backward(self, world_size):
+    def finalize_backward(self):
         for future, bucket in self.futures:
             future.wait()
             flat_grads = future.result()
-            flat_grads[0].div_(world_size)
+            flat_grads[0].div_(self.world_size)
             self._unflatten_and_copy(flat_grads, bucket)
+
         self.futures.clear()
+        self.reduced_buckets_count = 0
 
     def _unflatten_and_copy(self, flat_grads, bucket):
         offset = 0
-        for name, grad in bucket.gradients.items():
-            numel = grad.numel()
-            if name in bucket.parameters:
-                param = bucket.parameters[name]
-                param.grad = flat_grads[0][offset:offset+numel].view_as(grad)
-                offset += numel
-        bucket.reset()
+        for name, param in bucket.parameters.items():
+            numel = param.grad.numel()
+            param.grad = flat_grads[0][offset:offset+numel].view_as(param)
+            offset += numel
+        bucket.grad_count = 0
+
+    
+    def _measure_gpu_memory(self, stage):
+        torch.cuda.synchronize()
+        memory_allocated = torch.cuda.memory_allocated() / 1024**2  # Convert to MB
+        memory_reserved = torch.cuda.memory_reserved() / 1024**2  # Convert to MB
+        print(f"{stage}:")
+        print(f"  Allocated: {memory_allocated:.2f} MB")
+        print(f"  Reserved:  {memory_reserved:.2f} MB")
+
 
 class CustomDDP(nn.Module):
-    def __init__(self, module, process_group, bucket_cap_mb=25): 
+    def __init__(self, module, process_group, is_master, bucket_cap_mb=25): 
         super().__init__()
         self.module = module
         self.process_group = process_group
         world_size = dist.get_world_size(self.process_group)
-        self.reducer = Reducer(self.module.named_pameters(), bucket_cap_mb, world_size)
-        self.require_backward_grad_sync = True
-        self._register_hooks()
-        
-    def _create_hook(self, name, param):
-        def hook(grad):
-            if self.require_backward_grad_sync:
-                accumulated_grad = param.grad + grad
-                self.reducer.add_grad(name, accumulated_grad)
-        return hook
-
-    def _register_hooks(self):
-        for name, param in self.module.named_parameters():
-            if param.requires_grad:
-                hook = self._create_hook(name, param)
-                param.register_hook(hook)
+        self.reducer = Reducer(self.module.named_parameters(), bucket_cap_mb, world_size)
 
     def set_require_backward_grad_sync(self, require_sync):
-        self.require_backward_grad_sync = require_sync
+        self.reducer.require_backward_grad_sync = require_sync
 
     def forward(self, *args, **kwargs):
         return self.module(*args, **kwargs)
     
-    def finalize_backward(self):
-        self.reducer.finalize_backward()
 
 class FSDPUnit:
     def __init__(self, module_list, param_init_fn, world_size, rank, unit_name):
