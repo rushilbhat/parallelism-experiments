@@ -87,7 +87,7 @@ class Reducer:
 
 
 class CustomDDP(nn.Module):
-    def __init__(self, module, process_group, is_master, bucket_cap_mb=25): 
+    def __init__(self, module, process_group, bucket_cap_mb=25): 
         super().__init__()
         self.module = module
         self.process_group = process_group
