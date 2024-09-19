@@ -219,20 +219,21 @@ class FSDPUnit:
                     module = getattr(module, part)
                     setattr(module, name_parts[-1], unique_params[original])
   
-    def gather(self, include_grads=False, flag=False):
-        if self.flat_param.data_ptr() == self.local_shard.data_ptr(): #check if all shards have been gathered
+    def gather(self, include_grads=False, flag=True):
+        params_gathered = self.flat_param.data_ptr() != self.local_shard.data_ptr()
+        if not params_gathered:
             # if flag==True and self.is_master: print(f"Gather for backward through fsdp unit: {self.unit_name}")
             # if self.is_master: self._measure_gpu_memory(f"Before gathering unit {self.unit_name}")
-            full_tensor = torch.empty(self.local_shard.numel() * self.world_size, device=self.local_shard.device)
+            full_tensor = torch.zeros(self.local_shard.numel() * self.world_size, device=self.local_shard.device)
             # if self.is_master: self._measure_gpu_memory(f"After creating full tensor for {self.unit_name}")
             dist.all_gather_into_tensor(full_tensor, self.local_shard)
             self.flat_param.data = full_tensor
 
-            if include_grads:
-                full_grads_tensor = torch.zeros(self.local_shard.grad.numel() * self.world_size, device=self.local_shard.grad.device)
-                self.flat_param.grad = full_grads_tensor
+        if include_grads:
+            full_grads_tensor = torch.zeros(self.local_shard.grad.numel() * self.world_size, device=self.local_shard.grad.device)
+            self.flat_param.grad = full_grads_tensor
 
-            self.update_module_params(include_grads=include_grads)
+        self.update_module_params(include_grads=include_grads)
 
             # if flag:
             #     if not self.is_master: print("before")
@@ -306,8 +307,9 @@ class CustomFSDP(torch.nn.Module):
                 # (wrt declared order, not logical order) 
                 # CHANGE
                 if j == len(unit.module_list)-1: 
-                    module.register_forward_hook(lambda m, i, o, u=unit: u.shard())
-                    module.register_full_backward_pre_hook(lambda m, go, u=unit: u.pre_backward(include_grads=True, flag=True))
+                    if len(unit.module_list) == 1: 
+                        module.register_forward_hook(lambda m, i, o, u=unit: u.shard()) 
+                    module.register_full_backward_pre_hook(lambda m, go, u=unit: u.pre_backward(include_grads=True, flag=False))
 
             for name, param in unit.module_list.named_parameters():
                 param.register_post_accumulate_grad_hook(lambda p, u=unit, n=name: u.post_backward(n))
