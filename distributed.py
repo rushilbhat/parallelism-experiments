@@ -156,28 +156,23 @@ class FSDPUnit:
         total_numel = sum(self.param_numels)
         padded_size = math.ceil(total_numel / self.world_size) * self.world_size
         shard_size = padded_size // self.world_size
-        # if self.is_master: self._measure_gpu_memory(f"Before creating shard ")
-        self.local_shard = nn.Parameter(torch.empty(shard_size, device='cuda'))
+
+        # if self.is_master: self._measure_gpu_memory(f"Before creating flat param ")
+        self.flat_param = nn.Parameter(torch.zeros(padded_size, device='cuda'))
+        # if self.is_master: self._measure_gpu_memory(f"After creating flat param ")
+        self.local_shard = nn.Parameter(torch.zeros(shard_size, device='cuda'))
         self.local_shard.grad = torch.zeros_like(self.local_shard)
-        # if self.is_master: self._measure_gpu_memory(f"After creating shard and grad ")
-        
-        with torch.no_grad():
-            if self.is_master:
-                self.flat_param = nn.Parameter(torch.zeros(padded_size, device='cuda'))
-                # if self.is_master: self._measure_gpu_memory(f"After creating flat_param and grad ")
-                self.update_module_params(include_grads=False)
-                for m in self.module_list.modules():
-                    if len(list(m.children())) == 0 and hasattr(m, 'reset_parameters'): 
-                        m.reset_parameters() #doesn't break weight sharing scheme since it's an in place operation
-                self.module_list.apply(param_init_fn)
-                flat_param_shards = list(self.flat_param.chunk(self.world_size))
-
-            dist.scatter(self.local_shard.data, flat_param_shards if self.is_master else None, src=0)
-        
-        self.flat_param = nn.Parameter(self.local_shard)
-        self.flat_param.grad = self.local_shard.grad
+        # if self.is_master: self._measure_gpu_memory(f"After creating local_shard and grad ")
         self.update_module_params(include_grads=False)
+        for m in self.module_list.modules():
+            if len(list(m.children())) == 0 and hasattr(m, 'reset_parameters'): 
+                m.reset_parameters() #doesn't break weight sharing scheme since it's an in place operation
+        self.module_list.apply(param_init_fn)
 
+        start_idx = self.rank * shard_size
+        end_idx = start_idx + shard_size
+        self.local_shard.data.add_(self.flat_param[start_idx: end_idx])
+        self.shard()
 
     def update_module_params(self, include_grads, flag=False):
         is_sharded = self.flat_param.data_ptr() == self.local_shard.data_ptr()
@@ -258,7 +253,7 @@ class FSDPUnit:
             # if self.is_master: print(f"After sharding")
 
     def shard(self, include_grads=False, flag=False):
-        if self.flat_param.data_ptr() != self.local_shard.data_ptr(): #check if flat_params is not sharded            
+        if self.flat_param.data_ptr() != self.local_shard.data_ptr(): #check if flat_params is not sharded
             # if self.is_master: self._measure_gpu_memory(f"Before sharding unit {self.unit_name}", before_flag=True)
             self.flat_param.data = self.local_shard.data
             if include_grads:
