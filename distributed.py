@@ -250,14 +250,12 @@ class FSDPUnit:
         self.grad_counter += 1
         # if not self.is_master: print(self.grad_counter, len(list(self.module_list.parameters())), name)
         if self.grad_counter == len(list(self.module_list.parameters())):
-            dist.all_reduce(self.flat_param.grad, op=dist.ReduceOp.AVG)
-            shard_size = self.local_shard.numel()
-            start_idx = self.rank * shard_size
-            end_idx = start_idx + shard_size
-            self.local_shard.grad.add_(self.flat_param.grad[start_idx:end_idx])
+            grad_shards = list(self.flat_param.grad.chunk(self.world_size))
+            buffer = torch.empty(self.local_shard.shape, device='cuda')
+            dist.reduce_scatter(buffer, grad_shards, op=dist.ReduceOp.AVG)
+            self.local_shard.grad.add_(buffer)
             self.shard(include_grads=True, flag=True)
             # if self.is_master: print(f"After sharding")
-
 
     def shard(self, include_grads=False, flag=False):
         if self.flat_param.data_ptr() != self.local_shard.data_ptr(): #check if flat_params is not sharded            
