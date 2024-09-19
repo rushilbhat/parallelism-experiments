@@ -220,8 +220,8 @@ class FSDPUnit:
                     setattr(module, name_parts[-1], unique_params[original])
   
     def gather(self, include_grads=False, flag=True):
-        params_gathered = self.flat_param.data_ptr() != self.local_shard.data_ptr()
-        if not params_gathered:
+        params_sharded = self.flat_param.data_ptr() == self.local_shard.data_ptr()
+        if params_sharded:
             # if flag==True and self.is_master: print(f"Gather for backward through fsdp unit: {self.unit_name}")
             # if self.is_master: self._measure_gpu_memory(f"Before gathering unit {self.unit_name}")
             full_tensor = torch.zeros(self.local_shard.numel() * self.world_size, device=self.local_shard.device)
