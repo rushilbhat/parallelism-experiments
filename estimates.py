@@ -14,78 +14,65 @@ class ModelDimensions:
     V: int  # vocabulary size
 
 class PrecisionType(Enum):
-    FULL = "full"      # FP32 training
-    MIXED = "mixed"    # Mixed precision training
+    FULL = "full" 
+    MIXED = "mixed"
 
 
-def get_params_count(dims: ModelDimensions) -> Dict[str, int]:
-    s, h, V = dims.s, dims.h, dims.V
+def get_param_counts(dims: ModelDimensions) -> Dict[str, int]:
+    s, h, L, V = dims.s, dims.h, dims.L, dims.V
     return {
-        'wpe': dims.s * h,
-        'qkv_proj': 3 * h ** 2,
-        'output_proj': h ** 2,
-        'mlp_up_proj': 4 * h ** 2,
-        'mlp_down_proj': 4 * h ** 2,
-        'block_layer_norms': 2 * 2 * h,
+        'wpe': s * h,
+        'qkv_proj': 3 * h ** 2 * L,
+        'output_proj': h ** 2 * L,
+        'mlp_up_proj': 4 * h ** 2 * L,
+        'mlp_down_proj': 4 * h ** 2 * L,
+        'block_layer_norms': 2 * 2 * h * L,
         'final_layer_norm': 2 * h,
         'lm_head': h * V #wte weights shared with lm_head 
     }
 
 def get_activation_counts(dims: ModelDimensions) -> Dict[str, int]:
-    b, s, h, a, d = dims.b, dims.s, dims.h, dims.a, dims.d
+    b, s, h, a, d, L = dims.b, dims.s, dims.h, dims.a, dims.d, dims.L
     return {
         'embeddings_sum': (b * s * h) + (s * h),
-        'qkv_proj': (b * s * h),
-        'qkT': 2 * (b * a * s * d),
-        'scaling': b * a * s ** 2,
-        # 'masking': (s ** 2) + (b * a * s ** 2),
-        'softmax': b * a * s ** 2,
-        'att_mm_v': (b * a * s ** 2) + (b * a * s * d),
-        'output_proj': (b * s * h),
-        'mlp_up_proj': (b * s * h),
-        'gelu': b * s * 4 * h,
-        'mlp_down_proj': (b * s * 4 * h),
-        'block_layer_norms': 2 * ((b * s * h) + (2 * b * s)),
-        'block_residuals': 2 * 2 * (b * s * h),
+        'qkv_proj': (b * s * h) * L,
+        'qkT': 2 * (b * a * s * d) * L,
+        'scaling': (b * a * s ** 2) * L,
+        # 'masking': ((s ** 2) + (b * a * s ** 2)) * L,
+        'softmax': (b * a * s ** 2) * L,
+        'att_mm_v': ((b * a * s ** 2) + (b * a * s * d)) * L,
+        'output_proj': (b * s * h) * L,
+        'mlp_up_proj': (b * s * h) * L,
+        'gelu': (b * s * 4 * h) * L,
+        'mlp_down_proj': (b * s * 4 * h) * L,
+        'block_layer_norms': 2 * ((b * s * h) + (2 * b * s)) * L,
+        'block_residuals': 2 * 2 * (b * s * h) * L,
         'final_layer_norm': (b * s * h) + (2 * b * s),
         'lm_head': (b * s * h)
     }
 
 def calculate_memory_requirements(dims: ModelDimensions, precision: PrecisionType) -> Dict[str, Tuple[float, str]]:
-    param_counts = get_params_count(dims)    
-    params_per_layer = sum(
-        count for name, count in param_counts.items() 
-        if name not in ['wpe', 'final_layer_norm', 'lm_head']
-    )
-    P = param_counts['wpe'] + params_per_layer * dims.L + param_counts['final_layer_norm'] + param_counts['lm_head']
-
-
+    param_counts = get_param_counts(dims)    
+    P = sum(param_counts.values())
+    
     param_mem = 4 * P if precision == PrecisionType.FULL else 6 * P
     gradient_mem = 4 * P if precision == PrecisionType.FULL else 6 * P
     optimizer_mem = 8 * P
-    buffer_mem = (dims.s ** 2) * dims.L
+    buffer_mem = 4 * (dims.s ** 2) * dims.L
 
-    layer_ops = ['qkv_proj', 'qkT', 'scaling', 'softmax', 'att_mm_v', 'output_proj', 
-                 'mlp_up_proj', 'gelu', 'mlp_down_proj', 
-                 'block_layer_norms', 'block_residuals']
-    matmul_ops = ['qkv_proj', 'qkT', 'att_mm_v', 'output_proj', 
-                  'mlp_up_proj', 'mlp_down_proj', 
-                  'lm_head']
-    activation_counts = get_activation_counts(dims)
-
-
+    matmul_ops = ['qkv_proj', 'qkT', 'att_mm_v', 'output_proj', 'mlp_up_proj', 'mlp_down_proj', 'lm_head']
     activation_mem = 0
+    activation_counts = get_activation_counts(dims)
     for op, count in activation_counts.items():
-        total_count = count * (dims.L if op in layer_ops else 1)
         if precision == PrecisionType.MIXED and op in matmul_ops:
-            activation_mem += total_count * 2
+            activation_mem += count * 2
         else:
-            activation_mem += total_count * 4
-        
+            activation_mem += count * 4
+   
     total_mem_gb = (param_mem + gradient_mem + optimizer_mem + buffer_mem + activation_mem) / (2**30)
     return total_mem_gb
 
-
+#-----------------------------------UPDATE--------------------------------------------
 def get_flops(dims: ModelDimensions) -> Dict[str, int]:
     b, s, h, a, d, L, V = dims.b, dims.s, dims.h, dims.a, dims.d, dims.L, dims.V
     return {
@@ -106,7 +93,7 @@ def get_flops(dims: ModelDimensions) -> Dict[str, int]:
     }
 
 def estimate_mops_latencies(dims: ModelDimensions) -> Dict[str, float]:
-    params = get_params_count(dims)
+    params = get_param_counts(dims)
     activations = get_activation_counts(dims)
 
     memory_bandwidth = 1555e9 #3.35e12
@@ -184,7 +171,7 @@ def estimate_combined_latencies(dims: ModelDimensions, efficiency: float = 0.8) 
 
 def estimate_flops_memory_arithmetic_intensities(dims: ModelDimensions):
     flops = get_flops(dims)
-    params = get_params_count(dims)
+    params = get_param_counts(dims)
     activations = get_activation_counts(dims)
 
     layer_ops = ['qkv_proj', 'qkT', 'scaling', 'softmax', 'att_mm_v', 'output_proj', 
