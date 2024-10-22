@@ -32,7 +32,7 @@ def get_param_counts(dims: ModelDimensions) -> Dict[str, int]:
     }
 
 def get_activation_counts(dims: ModelDimensions) -> Dict[str, int]:
-    b, s, h, a, d, L = dims.b, dims.s, dims.h, dims.a, dims.d, dims.L
+    b, s, h, a, d, L, V = dims.b, dims.s, dims.h, dims.a, dims.d, dims.L, dims.V
     return {
         'embeddings_sum': (b * s * h) + (s * h),
         'qkv_proj': (b * s * h) * L,
@@ -48,7 +48,8 @@ def get_activation_counts(dims: ModelDimensions) -> Dict[str, int]:
         'block_layer_norms': 2 * ((b * s * h) + (2 * b * s)) * L,
         'block_residuals': 2 * 2 * (b * s * h) * L,
         'final_layer_norm': (b * s * h) + (2 * b * s),
-        'lm_head': (b * s * h)
+        'lm_head': (b * s * h),
+        'cross_entropy': (b * s * V)
     }
 
 def calculate_memory_requirements(dims: ModelDimensions, precision: PrecisionType) -> Dict[str, Tuple[float, str]]:
