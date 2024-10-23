@@ -75,7 +75,7 @@ def get_activation_memory(dims: ModelDimensions, precision: PrecisionType) -> Di
 
     return activation_memory
 
-def calculate_total_memory(dims: ModelDimensions, precision: PrecisionType) -> Dict[str, Tuple[float, str]]:
+def calculate_total_memory(dims: ModelDimensions, precision: PrecisionType) -> float:
     param_counts = get_param_counts(dims)    
     P = sum(param_counts.values())
     
