@@ -121,7 +121,8 @@ def get_flops(dims: ModelDimensions) -> Dict[str, int]:
         'block_layer_norms': (2 * (5 * b * s * h)) * L,
         'block_residuals': (2 * (b * s * h)) * L,
         'final_layer_norm': 5 * b * s * h,
-        'lm_head': 2 * b * s * h * V
+        'lm_head': 2 * b * s * h * V,
+        'cross_entropy': (6 * b * s * V) + (b * s)
     }
 
 def estimate_flops_latencies(dims: ModelDimensions, precision: PrecisionType, accelerator: str, efficiency: float = 0.8) -> Dict[str, float]:
