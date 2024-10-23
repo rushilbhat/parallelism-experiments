@@ -88,18 +88,21 @@ def calculate_total_memory(dims: ModelDimensions, precision: PrecisionType) -> f
     total_mem_gb = (param_mem + gradient_mem + optimizer_mem + buffer_mem + activation_mem) / (2**30)
     return total_mem_gb
 
-def estimate_mops_latencies(dims: ModelDimensions, precision: PrecisionType) -> Dict[str, float]:
+def estimate_mops_latencies(dims: ModelDimensions, precision: PrecisionType, accelerator: str) -> Dict[str, float]:
     param_mems = get_param_memory(dims, precision)
     activation_mems = get_activation_memory(dims, precision)
 
-    memory_bandwidth = 1555e9 #3.35e12
-    
-    latencies = {}
-    for op in activation_mems.keys():
-        param_mem = param_mems.get(op, 0)
-        act_mem = activation_mems.get(op, 0)
-        latencies[op] = (param_mem + act_mem) / memory_bandwidth
-        
+    memory_bandwidths = {
+        "H100": 3.35e12,
+        "A100": 1555e9
+    }
+    memory_bandwidth = memory_bandwidths[accelerator]
+
+    latencies = {
+        op: (param_mems.get(op, 0) + activation_mems[op]) / memory_bandwidth
+        for op in activation_mems.keys()
+    }
+
     return latencies
 
 def get_flops(dims: ModelDimensions) -> Dict[str, int]:
