@@ -52,23 +52,38 @@ def get_activation_counts(dims: ModelDimensions) -> Dict[str, int]:
         'cross_entropy': (b * s * V)
     }
 
-def calculate_memory_requirements(dims: ModelDimensions, precision: PrecisionType) -> Dict[str, Tuple[float, str]]:
+def get_param_memory(dims: ModelDimensions, precision: PrecisionType) -> Dict[str, int]:
+    param_counts = get_param_counts(dims)
+    bytes_per_element = 4 if PrecisionType.FULL else 2
+    param_memory = {
+        name: count * bytes_per_element 
+        for name, count in param_counts.items()
+    }
+    return param_memory
+
+def get_activation_memory(dims: ModelDimensions, precision: PrecisionType) -> Dict[str, int]:
+    activation_counts = get_activation_counts(dims)
+    matmul_ops = {'qkv_proj', 'qkT', 'att_mm_v', 'output_proj', 'mlp_up_proj', 'mlp_down_proj', 'lm_head'}
+
+    activation_memory = {}
+    for name, count in activation_counts.items():
+        if precision == PrecisionType.MIXED and name in matmul_ops:
+            bytes_per_element = 2
+        else:
+            bytes_per_element = 4
+        activation_memory[name] = count * bytes_per_element
+
+    return activation_memory
+
+def calculate_total_memory(dims: ModelDimensions, precision: PrecisionType) -> Dict[str, Tuple[float, str]]:
     param_counts = get_param_counts(dims)    
     P = sum(param_counts.values())
     
-    param_mem = 4 * P if precision == PrecisionType.FULL else 6 * P
-    gradient_mem = 4 * P if precision == PrecisionType.FULL else 6 * P
-    optimizer_mem = 8 * P
+    param_mem = 4 * P if precision == PrecisionType.FULL else 2 * P
+    gradient_mem = 4 * P if precision == PrecisionType.FULL else 2 * P
+    optimizer_mem = 8 * P if precision == PrecisionType.FULL else 16 * P
     buffer_mem = 4 * (dims.s ** 2) * dims.L
-
-    matmul_ops = ['qkv_proj', 'qkT', 'att_mm_v', 'output_proj', 'mlp_up_proj', 'mlp_down_proj', 'lm_head']
-    activation_mem = 0
-    activation_counts = get_activation_counts(dims)
-    for op, count in activation_counts.items():
-        if precision == PrecisionType.MIXED and op in matmul_ops:
-            activation_mem += count * 2
-        else:
-            activation_mem += count * 4
+    activation_mem = sum(get_activation_memory(dims, precision).values())
    
     total_mem_gb = (param_mem + gradient_mem + optimizer_mem + buffer_mem + activation_mem) / (2**30)
     return total_mem_gb
@@ -101,7 +116,6 @@ def estimate_mops_latencies(dims: ModelDimensions) -> Dict[str, float]:
     bytes_per_element = 4
     
     latencies = {}
-
 
     for op in activations.keys():
         param_mem = params.get(op, 0) * bytes_per_element
@@ -276,7 +290,7 @@ def main():
     ]
 
     BATCH_SIZE = 8
-    SEQ_LENGTH = 1024
+    SEQ_LENGTH = 2048
     VOCAB_SIZE = 50257
 
     print(f"{'Model':<8} {'Tot FLOPS':<10} {'MM FLOPS':<10} {'Oth FLOPS':<10} "
@@ -295,6 +309,10 @@ def main():
             s=SEQ_LENGTH,
             V=VOCAB_SIZE
         )
+
+        print(calculate_memory_requirements(dims, PrecisionType.MIXED))
+        import sys; sys.exit()
+
         
         results = estimate_flops_memory_arithmetic_intensities(dims)
         
