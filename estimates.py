@@ -54,7 +54,7 @@ def get_activation_counts(dims: ModelDimensions) -> Dict[str, int]:
 
 def get_param_memory(dims: ModelDimensions, precision: PrecisionType) -> Dict[str, int]:
     param_counts = get_param_counts(dims)
-    bytes_per_element = 4 if PrecisionType.FULL else 2
+    bytes_per_element = 4 if precision == PrecisionType.FULL else 2
     param_memory = {
         name: count * bytes_per_element 
         for name, count in param_counts.items()
