@@ -102,25 +102,27 @@ def estimate_mops_latencies(dims: ModelDimensions, precision: PrecisionType) -> 
         
     return latencies
 
-#-----------------------------------UPDATE--------------------------------------------
 def get_flops(dims: ModelDimensions) -> Dict[str, int]:
     b, s, h, a, d, L, V = dims.b, dims.s, dims.h, dims.a, dims.d, dims.L, dims.V
     return {
         'embeddings_sum': 2 * b * s * h,
-        'qkv_proj': 6 * b * s * h ** 2,
-        'qkT': 2 * b * a * (s ** 2) * d,
-        'scaling': b * a * s ** 2,
-        'softmax': 5 * b * a * s ** 2,
-        'att_mm_v': 2 * b * a * (s ** 2) * d,
-        'output_proj': 2 * b * s * h ** 2,
-        'mlp_up_proj': 8 * b * s * h ** 2,
-        'gelu': 8 * b * s * h,
-        'mlp_down_proj': 8 * b * s * h ** 2,
-        'block_layer_norms': 2 * (5 * b * s * h),
-        'block_residuals': 2 * (b * s * h),
+        'qkv_proj': (6 * b * s * h ** 2) * L,
+        'qkT': (2 * b * a * (s ** 2) * d) * L,
+        'scaling': (b * a * s ** 2) * L,
+        'softmax': (5 * b * a * s ** 2) * L,
+        'att_mm_v': (2 * b * a * (s ** 2) * d) * L,
+        'output_proj': (2 * b * s * h ** 2) * L,
+        'mlp_up_proj': (8 * b * s * h ** 2) * L,
+        'gelu': (8 * b * s * h) * L,
+        'mlp_down_proj': (8 * b * s * h ** 2) * L,
+        'block_layer_norms': (2 * (5 * b * s * h)) * L,
+        'block_residuals': (2 * (b * s * h)) * L,
         'final_layer_norm': 5 * b * s * h,
         'lm_head': 2 * b * s * h * V
     }
+
+#-----------------------------------UPDATE--------------------------------------------
+
 
 
 def estimate_flops_latencies(dims: ModelDimensions, efficiency: float = 0.8) -> Dict[str, float]:
