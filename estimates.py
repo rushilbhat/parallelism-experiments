@@ -88,6 +88,20 @@ def calculate_total_memory(dims: ModelDimensions, precision: PrecisionType) -> f
     total_mem_gb = (param_mem + gradient_mem + optimizer_mem + buffer_mem + activation_mem) / (2**30)
     return total_mem_gb
 
+def estimate_mops_latencies(dims: ModelDimensions, precision: PrecisionType) -> Dict[str, float]:
+    param_mems = get_param_memory(dims, precision)
+    activation_mems = get_activation_memory(dims, precision)
+
+    memory_bandwidth = 1555e9 #3.35e12
+    
+    latencies = {}
+    for op in activation_mems.keys():
+        param_mem = param_mems.get(op, 0)
+        act_mem = activation_mems.get(op, 0)
+        latencies[op] = (param_mem + act_mem) / memory_bandwidth
+        
+    return latencies
+
 #-----------------------------------UPDATE--------------------------------------------
 def get_flops(dims: ModelDimensions) -> Dict[str, int]:
     b, s, h, a, d, L, V = dims.b, dims.s, dims.h, dims.a, dims.d, dims.L, dims.V
@@ -107,27 +121,6 @@ def get_flops(dims: ModelDimensions) -> Dict[str, int]:
         'final_layer_norm': 5 * b * s * h,
         'lm_head': 2 * b * s * h * V
     }
-
-def estimate_mops_latencies(dims: ModelDimensions) -> Dict[str, float]:
-    params = get_param_counts(dims)
-    activations = get_activation_counts(dims)
-
-    memory_bandwidth = 1555e9 #3.35e12
-    bytes_per_element = 4
-    
-    latencies = {}
-
-    for op in activations.keys():
-        param_mem = params.get(op, 0) * bytes_per_element
-        act_mem = activations.get(op, 0) * bytes_per_element
-        latencies[op] = (param_mem + act_mem) / memory_bandwidth
-        
-    layer_ops = ['qkv_proj', 'qkT', 'scaling', 'softmax', 'att_mm_v', 'output_proj', 
-                'mlp_up_proj', 'gelu', 'mlp_down_proj', 'block_layer_norms', 'block_residuals']
-    for op in layer_ops:
-        latencies[op] *= dims.L
-
-    return latencies
 
 
 def estimate_flops_latencies(dims: ModelDimensions, efficiency: float = 0.8) -> Dict[str, float]:
