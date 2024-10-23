@@ -171,58 +171,32 @@ def estimate_combined_latencies(dims: ModelDimensions, precision: PrecisionType,
     
     return combined_latencies
 
-#-----------------------------------UPDATE--------------------------------------------
-
-def estimate_flops_memory_arithmetic_intensities(dims: ModelDimensions):
+def estimate_aggregate_flops_memory_arithmetic_intensity(dims: ModelDimensions, precision: PrecisionType) -> Dict[str, float]:
     flops = get_flops(dims)
-    params = get_param_counts(dims)
-    activations = get_activation_counts(dims)
+    param_mems = get_param_memory(dims, precision)
+    activation_mems = get_activation_memory(dims, precision)
 
-    layer_ops = ['qkv_proj', 'qkT', 'scaling', 'softmax', 'att_mm_v', 'output_proj', 
-                 'mlp_up_proj', 'gelu', 'mlp_down_proj', 
-                 'block_layer_norms', 'block_residuals']
-    matmul_ops = ['qkv_proj', 'qkT', 'att_mm_v', 'output_proj', 
-                  'mlp_up_proj', 'mlp_down_proj', 
-                  'lm_head']
-
-    # Calculate FLOPS
+    matmul_ops = {'qkv_proj', 'qkT', 'att_mm_v', 'output_proj', 'mlp_up_proj', 'mlp_down_proj', 'lm_head'}
     matmul_flops = other_flops = 0
     for op, op_flops in flops.items():
-        total_op_flops = op_flops * (dims.L if op in layer_ops else 1)
         if op in matmul_ops:
-            matmul_flops += total_op_flops
+            matmul_flops += op_flops
         else:
-            other_flops += total_op_flops
+            other_flops += op_flops
     total_flops = matmul_flops + other_flops
-    
-    # Calculate Memory
-    bytes_per_element = 4  # Assuming 32-bit floating point numbers
 
-    matmul_params = other_params = 0
-    for op, op_params in params.items():
-        total_op_params = op_params * (dims.L if op in layer_ops else 1)
+    matmul_memory = other_memory = 0
+    for op in activation_mems.keys():
+        op_memory = param_mems.get(op, 0) + activation_mems[op]
         if op in matmul_ops:
-            matmul_params += total_op_params
-        elif op != 'wpe':
-            other_params += total_op_params
-
-    
-    matmul_activations = other_activations = 0
-    for op, op_activations in activations.items():
-        total_op_activations = op_activations * (dims.L if op in layer_ops else 1)
-        if op in matmul_ops:
-            matmul_activations += total_op_activations
+            matmul_memory += op_memory
         else:
-            other_activations += total_op_activations
-
-    matmul_memory = (matmul_params + matmul_activations) * bytes_per_element
-    other_memory = (other_params + other_activations) * bytes_per_element
+            other_memory += op_memory
     total_memory = matmul_memory + other_memory
-    
-    # Calculate Arithmetic Intensity (FLOPS per byte)
-    matmul_intensity = matmul_flops / matmul_memory
-    other_intensity = other_flops / other_memory
-    total_intensity = total_flops / total_memory
+
+    matmul_ai = matmul_flops / matmul_memory
+    other_ai = other_flops / other_memory
+    total_ai = total_flops / total_memory
 
     return {
         'matmul_flops': matmul_flops,
@@ -231,9 +205,9 @@ def estimate_flops_memory_arithmetic_intensities(dims: ModelDimensions):
         'matmul_memory': matmul_memory,
         'other_memory': other_memory,
         'total_memory': total_memory,
-        'matmul_intensity': matmul_intensity,
-        'other_intensity': other_intensity,
-        'total_intensity': total_intensity
+        'matmul_ai': matmul_ai,
+        'other_ai': other_ai,
+        'total_ai': total_ai
     }
 
 def format_number(num):
@@ -246,24 +220,7 @@ def format_number(num):
     else:
         return f"{num:.2f}"
 
-def print_model_analysis(model_name, results):
-    print(f"\nDetailed breakdown for {model_name} model:")
-    print("\nFLOPS Breakdown:")
-    print(f"Matmul FLOPS: {format_number(results['matmul_flops'])}")
-    print(f"Other FLOPS: {format_number(results['other_flops'])}")
-    print(f"Total FLOPS: {format_number(results['total_flops'])}")
-
-    print("\nMemory Breakdown:")
-    print(f"Matmul Memory: {format_number(results['matmul_memory'])} bytes")
-    print(f"Other Memory: {format_number(results['other_memory'])} bytes")
-    print(f"Total Memory: {format_number(results['total_memory'])} bytes")
-
-    print("\nArithmetic Intensity:")
-    print(f"Matmul AI: {results['matmul_intensity']:.2f} FLOPS/byte")
-    print(f"Other AI: {results['other_intensity']:.2f} FLOPS/byte")
-    print(f"Total AI: {results['total_intensity']:.2f} FLOPS/byte")
-    print("-" * 60)
-
+#-----------------------------------UPDATE--------------------------------------------
 
 def main():
     models = [
@@ -279,11 +236,11 @@ def main():
     ]
 
     BATCH_SIZE = 8
-    SEQ_LENGTH = 2048
+    SEQ_LENGTH = 1024
     VOCAB_SIZE = 50257
 
-    precision = PrecisionType.MIXED
-    accelerator = "H100"
+    precision = PrecisionType.FULL
+    accelerator = "A100"
 
     print(f"{'Model':<8} {'Tot FLOPS':<10} {'MM FLOPS':<10} {'Oth FLOPS':<10} "
           f"{'Tot Mem':<10} {'MM Mem':<10} {'Oth Mem':<10} "
@@ -301,15 +258,8 @@ def main():
             s=SEQ_LENGTH,
             V=VOCAB_SIZE
         )
-
-        mops_latencies = estimate_mops_latencies(dims, precision)
-        flops_latencies = estimate_flops_latencies(dims, precision, accelerator, 1.0) 
-        print(mops_latencies)
-        print(flops_latencies)       
-        import sys; sys.exit()
-
         
-        results = estimate_flops_memory_arithmetic_intensities(dims)
+        results = estimate_aggregate_flops_memory_arithmetic_intensity(dims, precision)
         
         total_flops = format_number(results['total_flops'])
         matmul_flops = format_number(results['matmul_flops'])
@@ -317,9 +267,9 @@ def main():
         total_memory = format_number(results['total_memory'])
         matmul_memory = format_number(results['matmul_memory'])
         other_memory = format_number(results['other_memory'])
-        total_ai = format_number(results['total_intensity'])
-        matmul_ai = format_number(results['matmul_intensity'])
-        other_ai = format_number(results['other_intensity'])
+        total_ai = format_number(results['total_ai'])
+        matmul_ai = format_number(results['matmul_ai'])
+        other_ai = format_number(results['other_ai'])
 
             
         print(f"{model_name:<8} {total_flops:<10} {matmul_flops:<10} {other_flops:<10} "
