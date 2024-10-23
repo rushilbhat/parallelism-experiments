@@ -121,63 +121,54 @@ def get_flops(dims: ModelDimensions) -> Dict[str, int]:
         'lm_head': 2 * b * s * h * V
     }
 
-#-----------------------------------UPDATE--------------------------------------------
-
-
-
-def estimate_flops_latencies(dims: ModelDimensions, efficiency: float = 0.8) -> Dict[str, float]:
+def estimate_flops_latencies(dims: ModelDimensions, precision: PrecisionType, accelerator: str, efficiency: float = 0.8) -> Dict[str, float]:
     flops = get_flops(dims)
     
-    h100_fp32_peak = 67e12  # 494 TFLOPS for FP32
-    h100_tf32_peak = 989e12  # 989 TFLOPS for TF32
-    h100_bf16_peak = 1979e12
-    a100_fp32_peak = 19.5e12
-    a100_tf32_peak = 156e12
-    a100_bf16_peak = 312e12
+    throughputs = {
+        "H100": {
+            "cuda": 67e12,         # FP32 CUDA core throughput in FLOPs per second
+            "tensor": {
+                PrecisionType.FULL: 989e12,  # TF32 throughput in FLOPs per second
+                PrecisionType.MIXED: 1979e12, # BF16 throughput in FLOPs per second
+            }
+        },
+        "A100": {
+            "cuda": 19.5e12,       # FP32 CUDA core throughput in FLOPs per second
+            "tensor": {
+                PrecisionType.FULL: 156e12,   # TF32 throughput in FLOPs per second
+                PrecisionType.MIXED: 312e12,  # BF16 throughput in FLOPs per second
+            }
+        }
+    }
 
-    # Adjust peak performance by efficiency factor
-    # efficiency = 1
-    h100_fp32_peak *= efficiency
-    h100_tf32_peak *= efficiency
-    h100_bf16_peak *= efficiency
-    a100_fp32_peak *= efficiency
-    a100_tf32_peak *= efficiency
-    a100_bf16_peak *= efficiency
+    cuda_core_throughput = throughputs[accelerator]['cuda']
+    tensor_core_throughput = throughputs[accelerator]['tensor'][precision]
 
-    
+    matmul_ops = {'qkv_proj', 'qkT', 'att_mm_v', 'output_proj', 'mlp_up_proj', 'mlp_down_proj', 'lm_head'}
+
     latencies = {}
-    
-    matmul_ops = ['qkv_proj', 'qkT', 'att_mm_v', 'output_proj', 'mlp_up_proj', 'mlp_down_proj', 'lm_head']
-    
-    # Calculate latencies
     for op, op_flops in flops.items():
         if op in matmul_ops:
-            latencies[op] = op_flops / a100_tf32_peak
+            latency = op_flops / (tensor_core_throughput * efficiency)
         else:
-            latencies[op] = op_flops / a100_fp32_peak
-    
-    # Multiply by number of layers for layer-specific operations
-    layer_ops = ['qkv_proj', 'qkT', 'scaling', 'softmax', 'att_mm_v', 'output_proj', 
-                 'mlp_up_proj', 'gelu', 'mlp_down_proj', 'block_layer_norms', 'block_residuals']
-    for op in layer_ops:
-        latencies[op] *= dims.L
+            latency = op_flops / (cuda_core_throughput * efficiency)
+        latencies[op] = latency
     
     return latencies
 
-def estimate_combined_latencies(dims: ModelDimensions, efficiency: float = 0.8) -> Dict[str, float]:
-    mops_latencies = estimate_mops_latencies(dims)
-    flops_latencies = estimate_flops_latencies(dims, efficiency)
+def estimate_combined_latencies(dims: ModelDimensions, precision: PrecisionType, accelerator: str, efficiency: float = 0.8) -> Dict[str, float]:
+    mops_latencies = estimate_mops_latencies(dims, precision)
+    flops_latencies = estimate_flops_latencies(dims, precision, accelerator, efficiency)
     
-    combined_latencies = {}
-    
-    for op in mops_latencies.keys():
-        if op != 'total':
-            combined_latencies[op] = max(mops_latencies[op], flops_latencies[op])
-    
+    combined_latencies = {
+        op : max(mops_latencies[op], flops_latencies[op])
+        for op in mops_latencies.keys()
+    }    
     combined_latencies['total'] = sum(combined_latencies.values())
     
     return combined_latencies
 
+#-----------------------------------UPDATE--------------------------------------------
 
 def estimate_flops_memory_arithmetic_intensities(dims: ModelDimensions):
     flops = get_flops(dims)
@@ -288,6 +279,9 @@ def main():
     SEQ_LENGTH = 2048
     VOCAB_SIZE = 50257
 
+    precision = PrecisionType.MIXED
+    accelerator = "H100"
+
     print(f"{'Model':<8} {'Tot FLOPS':<10} {'MM FLOPS':<10} {'Oth FLOPS':<10} "
           f"{'Tot Mem':<10} {'MM Mem':<10} {'Oth Mem':<10} "
           f"{'Tot AI':<8} {'MM AI':<8} {'Oth AI':<8}")
@@ -305,7 +299,10 @@ def main():
             V=VOCAB_SIZE
         )
 
-        print(calculate_memory_requirements(dims, PrecisionType.MIXED))
+        mops_latencies = estimate_mops_latencies(dims, precision)
+        flops_latencies = estimate_flops_latencies(dims, precision, accelerator, 1.0) 
+        print(mops_latencies)
+        print(flops_latencies)       
         import sys; sys.exit()
 
         
