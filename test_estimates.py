@@ -1,13 +1,13 @@
 import estimates
 from estimates import ModelDimensions, PrecisionType
 
-def calculate_actual_flops_memory_arithmetic_intensities(dims: ModelDimensions):
+def calculate_actual_flops_memory_arithmetic_intensities(dims: ModelDimensions, precision: PrecisionType):
     b, s, h, a, d, L, V = dims.b, dims.s, dims.h, dims.a, dims.d, dims.L, dims.V
-    
+
     actual_matmul_flops = (24*b*s*(h**2) + 4*b*a*(s**2)*d) * L + 2*b*s*h*V
     actual_other_flops = (6*b*a*(s**2) + 20*b*s*h) * L + 6*b*s*V + 7*b*s*h + b*s
     actual_total_flops = actual_matmul_flops + actual_other_flops
-    actual_matmul_memory = ((b*a*(s**2) + 12*(h**2) + 7*b*s*h + 3*b*a*s*d)*L + h*V + b*s*h) * 4
+    actual_matmul_memory = ((b*a*(s**2) + 12*(h**2) + 7*b*s*h + 3*b*a*s*d)*L + h*V + b*s*h) * (4 if precision == PrecisionType.FULL else 2)
     actual_other_memory = ((2*b*a*(s**2) + 10*b*s*h + 4*b*s + 4*h)*L + b*s*V + 2*b*s*h + 2*b*s + s*h + 2*h) * 4
     actual_total_memory = actual_matmul_memory + actual_other_memory
     actual_matmul_ai = actual_matmul_flops / actual_matmul_memory
@@ -143,10 +143,10 @@ def run_tests():
             V=VOCAB_SIZE
         )
 
-        precision = PrecisionType.FULL
+        precision = PrecisionType.MIXED
         
         estimated_results = estimates.estimate_aggregate_flops_memory_arithmetic_intensity(dims, precision)
-        actual_results = calculate_actual_flops_memory_arithmetic_intensities(dims)
+        actual_results = calculate_actual_flops_memory_arithmetic_intensities(dims, precision)
 
         for metric in estimated_results.keys():
             compare_results(estimated_results[metric], actual_results[metric], metric)        
