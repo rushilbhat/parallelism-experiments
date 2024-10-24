@@ -116,7 +116,7 @@ def get_flops(dims: ModelDimensions) -> Dict[str, int]:
         'att_mm_v': (2 * b * a * (s ** 2) * d) * L,
         'output_proj': (2 * b * s * h ** 2) * L,
         'mlp_up_proj': (8 * b * s * h ** 2) * L,
-        'gelu': (8 * b * s * h) * L,
+        'gelu': (32 * b * s * h) * L,
         'mlp_down_proj': (8 * b * s * h ** 2) * L,
         'block_layer_norms': (2 * (5 * b * s * h)) * L,
         'block_residuals': (2 * (b * s * h)) * L,
