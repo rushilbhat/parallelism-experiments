@@ -130,17 +130,17 @@ def estimate_flops_latencies(dims: ModelDimensions, precision: PrecisionType, ac
     
     throughputs = {
         "H100": {
-            "cuda": 67e12,         # FP32 CUDA core throughput in FLOPs per second
+            "cuda": 67e12,
             "tensor": {
-                PrecisionType.FULL: 989e12,  # TF32 throughput in FLOPs per second
-                PrecisionType.MIXED: 1979e12, # BF16 throughput in FLOPs per second
+                PrecisionType.FULL: 989e12,
+                PrecisionType.MIXED: 1979e12,
             }
         },
         "A100": {
-            "cuda": 19.5e12,       # FP32 CUDA core throughput in FLOPs per second
+            "cuda": 19.5e12,
             "tensor": {
-                PrecisionType.FULL: 156e12,   # TF32 throughput in FLOPs per second
-                PrecisionType.MIXED: 312e12,  # BF16 throughput in FLOPs per second
+                PrecisionType.FULL: 156e12,
+                PrecisionType.MIXED: 312e12,
             }
         }
     }
@@ -221,8 +221,6 @@ def format_number(num):
     else:
         return f"{num:.2f}"
 
-#-----------------------------------UPDATE--------------------------------------------
-
 def main():
     models = [
         ("125M", 12, 12, 768),
@@ -277,29 +275,5 @@ def main():
               f"{total_memory:<10} {matmul_memory:<10} {other_memory:<10} "
               f"{total_ai:<8} {matmul_ai:<8} {other_ai:<8}")
 
-        
-    
-        # print(24 * dims.b*dims.s*(dims.h**2)*dims.L + 4*dims.b*dims.a*dims.s*dims.s*dims.d*dims.L + 2*dims.b*dims.s*dims.h*dims.V )
-        # print(20*dims.b*dims.s*dims.h*dims.L + 6*dims.b*dims.a*dims.s*dims.s*dims.L + 7*dims.b*dims.s*dims.h)
-
-        # import sys; sys.exit()
-
 if __name__ == '__main__':
     main()
-
-# dims = ModelDimensions(a=12, b=8, d=64, h=768, L=12, s=1024, V=50257)
-# mops_latencies = estimate_mops_latencies(dims)
-# flops_latencies = estimate_flops_latencies(dims)
-# combined_latencies = estimate_combined_latencies(dims)
-
-# print("\nComparison of latencies:")
-# print(f"{'Operation':<20} {'MOPS (ms)':<15} {'FLOPS (ms)':<15} {'Combined (ms)':<15}")
-# for op in combined_latencies.keys():
-#     if op != 'total':
-#         mops = mops_latencies.get(op, 0) * 1000
-#         flops = flops_latencies.get(op, 0) * 1000
-#         combined = combined_latencies[op] * 1000
-#         print(f"{op:<20} {mops:<15.6f} {flops:<15.6f} {combined:<15.6f}")
-
-# print(f"Total estimated latency: {combined_latencies['total']*1000:.6f} ms")
-
