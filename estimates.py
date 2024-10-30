@@ -407,6 +407,21 @@ def estimate_aggregate_flops(dims: ModelDimensions, precision: PrecisionType) ->
         'other_flops_backward': other_flops_bwd
     }
 
+def estimate_intra_node_gradient_communication_time(dims: ModelDimensions, accelerator:str, num_gpus: int) -> float:
+    total_gradients = sum(get_param_counts(dims).values())
+    data_size = total_gradients * 4
+
+    nvlink_unidirectional_bandwidths = {
+        "H100": 450e9,
+        "A100": 300e9
+    }
+    nvlink_latency = 0
+    
+    communication_time = 2 * (num_gpus - 1) * (nvlink_latency + data_size / (num_gpus * nvlink_unidirectional_bandwidths[accelerator]))
+
+    return communication_time
+
+
 # def format_number(num):
 #     if num >= 1e12:
 #         return f"{num/1e12:.2f}T"
