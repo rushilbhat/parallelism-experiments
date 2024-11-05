@@ -42,8 +42,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': [(b, s, h), (s, h)],
                 'output_dims': [(b, s, h)], #output
                 'activation_dims': {
-                    'fp32': [], # no tensor needed for backward pass 
-                    'fp16': [] # n/a - both tensors are fp32
+                    'float32': [], # no tensor needed for backward pass 
+                    'float16': [] # n/a - both tensors are float32
                 } 
             },
             'backward': {
@@ -51,7 +51,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': []
             },
             'is_matmul': False,
-            'is_per_layer': False
+            'is_per_layer': False,
+            'autocasts_to_float32': True
         },
         'pre_attn_layer_norm': {
             'forward': {
@@ -59,8 +60,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': [(b, s, h), (b, s), (b, s), (h,), (h,)], #input, mean, variance, gamma (param), beta (param)
                 'output_dims': [(b, s, h)], #output
                 'activation_dims': {
-                    'fp32': [(b, s, h), (b,s), (b,s)], #input, mean, variance
-                    'fp16': [] #n/a - only done fp32
+                    'float32': [(b, s, h), (b,s), (b,s)], #input, mean, variance
+                    'float16': [] #n/a - only done float32
                 }
             },
             'backward': {
@@ -68,7 +69,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': [(b, s, h), (b, s, h), (b, s), (b, s), (h,), (h,)] #output.grad, input, mean, variance, gamma (param), beta (param)
             },
             'is_matmul': False,
-            'is_per_layer': True        
+            'is_per_layer': True,
+            'autocasts_to_float32': True
         },
         'qkv_proj': {
             'forward': {
@@ -76,8 +78,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': [(b, s, h), (h, 3 * h)], #input, weight
                 'output_dims': [(b, s, 3*h)], #output
                 'activation_dims': {
-                    'fp32': [(b, s, h)], #input
-                    'fp16': [(b, s, h), (h, 3 * h)] #input, weight
+                    'float32': [(b, s, h)], #input
+                    'float16': [(b, s, h), (h, 3 * h)] #input, weight
                 }
             },
             'backward': {
@@ -85,7 +87,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': [(b, s, 3 * h), (b, s, 3 * h), (b, s, h), (h, h)], #output.grad, output.grad, input, weight
             },
             'is_matmul': True,
-            'is_per_layer': True
+            'is_per_layer': True,
+            'autocasts_to_float32': False
         },
         'qkT': {
             'forward': {
@@ -93,8 +96,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': [(b, a, s, d), (b, a, d, s)], #input (copy of q slice), input (copy of k slice)
                 'output_dims': [(b, a, s, s)], #output
                 'activation_dims': {
-                    'fp32': [(b, a, s, d), (b, a, d, s)], #input (copy of q slice), input (copy of k slice)
-                    'fp16': [(b, a, s, d), (b, a, d, s)] #input (copy of q slice), input (copy of k slice)
+                    'float32': [(b, a, s, d), (b, a, d, s)], #input (copy of q slice), input (copy of k slice)
+                    'float16': [(b, a, s, d), (b, a, d, s)] #input (copy of q slice), input (copy of k slice)
                 }
             },
             'backward': {
@@ -102,7 +105,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': [(b, a, s, s), (b, a, s, s), (b, a, s, d), (b, a, d, s)] #output.grad, output.grad, input (copy of q slice), input (copy of k slice)
             },
             'is_matmul': True,
-            'is_per_layer': True
+            'is_per_layer': True,
+            'autocasts_to_float32': False
         },
         'scaling': {
             'forward': {
@@ -110,8 +114,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': [(b, a, s, s)], #input
                 'output_dims': [(b, a, s, s)], #output
                 'activation_dims': {
-                    'fp32': [], # no tensor needed for backward pass
-                    'fp16': [] # no tensor needed for backward pass
+                    'float32': [], # no tensor needed for backward pass
+                    'float16': [] # no tensor needed for backward pass
                 }
             },
             'backward': {
@@ -119,7 +123,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': [(b, a, s, s)] #output.grad
             },
             'is_matmul': False,
-            'is_per_layer': True
+            'is_per_layer': True,
+            'autocasts_to_float32': False
         },
         'softmax': {
             'forward': {
@@ -127,8 +132,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': [(b, a, s, s)], #input
                 'output_dims': [(b, a, s, s)], #output
                 'activation_dims': {
-                    'fp32': [(b, a, s, s)], #output
-                    'fp16': [] #n/a - only done fp32
+                    'float32': [(b, a, s, s)], #output
+                    'float16': [] #n/a - only done float32
                 }
             },
             'backward': {
@@ -136,7 +141,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': [(b, a, s, s), (b, a, s, s)] #ouput.grad, output
             },
             'is_matmul': False,
-            'is_per_layer': True
+            'is_per_layer': True,
+            'autocasts_to_float32': True
         },
         'att_mm_v': {
             'forward': {
@@ -144,8 +150,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': [(b, a, s, s), (b, a, s, d)], #input, #input (copy of v slice)
                 'output_dims': [(b, a, s, d)], #output
                 'activation_dims': {
-                    'fp32': [(b, a, s, d)], #input (copy of v slice) only
-                    'fp16': [(b, a, s, s), (b, a, s, d)] #input (need fp16 copy of softmax output), #input (copy of v slice)
+                    'float32': [(b, a, s, d)], #input (copy of v slice) only
+                    'float16': [(b, a, s, s), (b, a, s, d)] #input (need float16 copy of softmax output), #input (copy of v slice)
                 }
             },
             'backward': {
@@ -153,7 +159,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': [(b, a, s, d), (b, a, s, d), (b, a, d, s), (b, a, s, s)] #output.grad, output.grad, input, input (copy of v slice)
             },
             'is_matmul': True,
-            'is_per_layer': True
+            'is_per_layer': True,
+            'autocasts_to_float32': False
         },
         'output_proj': {
             'forward': {
@@ -161,8 +168,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': [(b, s, h), (h, h)], #input, weight
                 'output_dims': [(b, s, h)], #output
                 'activation_dims': {
-                    'fp32': [(b, s, h)], #input
-                    'fp16': [(b, s, h), (h, h)] #input, weight
+                    'float32': [(b, s, h)], #input
+                    'float16': [(b, s, h), (h, h)] #input, weight
                 }
             },
             'backward': {
@@ -170,7 +177,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': [(b, s, h), (b, s, h), (b, s, h), (h, h)] #output.grad, output.grad, input, weight
             },
             'is_matmul': True,
-            'is_per_layer': True
+            'is_per_layer': True,
+            'autocasts_to_float32': False
         },
         'post_attn_residual': {
             'forward' : {
@@ -178,8 +186,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': [(b, s, h), (b, s, h)],
                 'output_dims': [(b, s, h)], #output
                 'activation_dims': {
-                    'fp32': [], # no tensor needed for backward pass
-                    'fp16': [] # n/a - at least 1 tensor is fp32 irrespective of full precision or mixed precision training
+                    'float32': [], # no tensor needed for backward pass
+                    'float16': [] # n/a - at least 1 tensor is float32 irrespective of full precision or mixed precision training
                 }
             },
             'backward': {
@@ -187,7 +195,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': []
             },
             'is_matmul': False,
-            'is_per_layer': True
+            'is_per_layer': True,
+            'autocasts_to_float32': True
         },
         'pre_mlp_layer_norm': {
             'forward': {
@@ -195,8 +204,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': [(b, s, h), (b, s), (b, s), (h,), (h,)], #input, mean, variance, gamma (param), beta (param)
                 'output_dims': [(b, s, h)], #output
                 'activation_dims': {
-                    'fp32': [(b, s, h), (b,s), (b,s)], #input, mean, variance
-                    'fp16': [] #n/a - only done fp32
+                    'float32': [(b, s, h), (b,s), (b,s)], #input, mean, variance
+                    'float16': [] #n/a - only done float32
                 }
             },
             'backward': {
@@ -204,7 +213,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': [(b, s, h), (b, s, h), (b, s), (b, s), (h,), (h,)] #output.grad, input, mean, variance, gamma (param), beta (param)
             },
             'is_matmul': False,
-            'is_per_layer': True
+            'is_per_layer': True,
+            'autocasts_to_float32': True
         },
         'mlp_up_proj': {
             'forward': {
@@ -212,8 +222,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': [(b, s, h), (h, 4 * h)], #input, weight
                 'output_dims': [(b, s, 4*h)], #output
                 'activation_dims': {
-                    'fp32': [(b, s, h)], #input
-                    'fp16': [(b, s, h), (h, 4*h)] #input, weight
+                    'float32': [(b, s, h)], #input
+                    'float16': [(b, s, h), (h, 4*h)] #input, weight
                 }
             },
             'backward': {
@@ -221,7 +231,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': [(b, s, 4 * h), (b, s, 4 * h), (b, s, h), (h, h)] #output.grad, output.grad, input, weight
             },
             'is_matmul': True,
-            'is_per_layer': True
+            'is_per_layer': True,
+            'autocasts_to_float32': False
         },
         'gelu': {
             'forward': {
@@ -229,8 +240,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': [(b, s, 4 * h)], #input
                 'output_dims': [(b, s, 4*h)], #output
                 'activation_dims': {
-                    'fp32': [(b, s, 4*h)], #input
-                    'fp16': [(b, s, 4*h)] #input
+                    'float32': [(b, s, 4*h)], #input
+                    'float16': [(b, s, 4*h)] #input
                 }
             },
             'backward': {
@@ -238,7 +249,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': [(b, s, 4 * h), (b, s, 4 * h)] #output.grad, input
             },
             'is_matmul': False,
-            'is_per_layer': True
+            'is_per_layer': True,
+            'autocasts_to_float32': False
         },
         'mlp_down_proj': {
             'forward': {
@@ -246,8 +258,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': [(b, s, 4 * h), (4 * h, h)], #input, weight
                 'output_dims': [(b, s, h)], #output
                 'activation_dims': {
-                    'fp32': [(b, s, 4*h)], #input
-                    'fp16': [(b, s, 4*h), (h, 4*h)] #input, weight
+                    'float32': [(b, s, 4*h)], #input
+                    'float16': [(b, s, 4*h), (h, 4*h)] #input, weight
                 }
             },
             'backward': {
@@ -255,7 +267,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': [(b, s, h), (b, s, h), (b, s, 4 * h), (4 * h, h)] #output.grad, output.grad, input, weight
             },
             'is_matmul': True,
-            'is_per_layer': True
+            'is_per_layer': True,
+            'autocasts_to_float32': False
         },
         'post_mlp_residual': {
             'forward' : {
@@ -263,8 +276,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': [(b, s, h), (b, s, h)],
                 'output_dims': [(b, s, h)], #output
                 'activation_dims': {
-                    'fp32': [], # no tensor needed for backward pass
-                    'fp16': [] # n/a - at least 1 tensor is fp32 irrespective of full precision or mixed precision training
+                    'float32': [], # no tensor needed for backward pass
+                    'float16': [] # n/a - at least 1 tensor is float32 irrespective of full precision or mixed precision training
                 }
             },
             'backward': {
@@ -272,7 +285,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': []
             },
             'is_matmul': False,
-            'is_per_layer': True
+            'is_per_layer': True,
+            'autocasts_to_float32': True
         },
         'final_layer_norm': {
             'forward': {
@@ -280,8 +294,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': [(b, s, h), (b, s), (b, s), (h,), (h,)],#input, mean, variance, gamma (param), beta (param)
                 'output_dims': [(b, s, h)], #output
                 'activation_dims': {
-                    'fp32': [(b, s, h), (b,s), (b,s)], #input, mean, variance
-                    'fp16': [] #n/a - only done fp32
+                    'float32': [(b, s, h), (b,s), (b,s)], #input, mean, variance
+                    'float16': [] #n/a - only done float32
                 }
             },
             'backward': {
@@ -289,7 +303,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': [(b, s, h), (b, s, h), (b, s), (b, s), (h,), (h,)]#output.grad, input, mean, variance, gamma (param), beta (param)
             },
             'is_matmul': False,
-            'is_per_layer': False
+            'is_per_layer': False,
+            'autocasts_to_float32': True
         },
         'lm_head': {
             'forward': {
@@ -297,8 +312,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': [(b, s, h), (h, V)], #input, weight
                 'output_dims': [(b, s, V)], #output
                 'activation_dims': {
-                    'fp32': [(b, s, h)], #input
-                    'fp16': [(b, s, h), (h,V)] #input, weight
+                    'float32': [(b, s, h)], #input
+                    'float16': [(b, s, h), (h,V)] #input, weight
                 }
             },
             'backward': {
@@ -306,7 +321,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': [(b, s, V), (b, s, V), (b, s, h), (h, V)] #output.grad, output.grad, input, weight
             },
             'is_matmul': True,
-            'is_per_layer': False
+            'is_per_layer': False,
+            'autocasts_to_float32': False
         },
         'log_softmax': {
             'forward': {
@@ -314,8 +330,8 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': [(b, s, V)], #input
                 'output_dims': [(b, s, V)], #output
                 'activation_dims': {
-                    'fp32': [(b,s, V)], #output
-                    'fp16': [] #n/a - only done fp32
+                    'float32': [(b,s, V)], #output
+                    'float16': [] #n/a - only done float32
                 }
             },
             'backward': {
@@ -323,20 +339,21 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'input_dims': [(b, s, V), (b, s, V)] #output.grad, output
             },
             'is_matmul': False,
-            'is_per_layer': False
+            'is_per_layer': False,
+            'autocasts_to_float32': True
         }
     }
-    
+
 def get_activation_memory(dims: ModelDimensions, precision: PrecisionType) -> Dict[str, int]:
     ops = get_gpt_ops(dims)
     activation_memory = {}
     for name, op_info in ops.items():
-        fp_16_count = sum(math.prod(dim) for dim in op_info['forward']['activation_dims']['fp16'])
-        fp_32_count = sum(math.prod(dim) for dim in op_info['forward']['activation_dims']['fp32'])
-        if precision == PrecisionType.FULL or (precision == PrecisionType.MIXED and fp_16_count == 0):
-            activation_memory[name] = fp_32_count * 4
+        float16_count = sum(math.prod(dim) for dim in op_info['forward']['activation_dims']['float16'])
+        float32_count = sum(math.prod(dim) for dim in op_info['forward']['activation_dims']['float32'])
+        if precision == PrecisionType.FULL or (precision == PrecisionType.MIXED and op_info['autocasts_to_float32']):
+            activation_memory[name] = float32_count * 4
         else:
-            activation_memory[name] = fp_16_count * 2
+            activation_memory[name] = float16_count * 2
     return activation_memory
 
 
@@ -345,7 +362,7 @@ def calculate_peak_memory(dims: ModelDimensions, precision: PrecisionType) -> fl
     P = sum(param_counts.values())
     
     param_mem = 4 * P
-    gradient_mem = 4 * P # assumes scheme under which grads persists like gradient accumulation
+    gradient_mem = 4 * P # assumes scheme under which grads persists (i.e grads initialised to zero or gradient accumulation
     optimizer_mem = 8 * P
     buffer_mem = 4 * (dims.s ** 2) * dims.L
     statically_allocated_mem = param_mem + gradient_mem + optimizer_mem + buffer_mem
