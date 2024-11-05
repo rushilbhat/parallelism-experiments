@@ -17,7 +17,6 @@ class PrecisionType(Enum):
     FULL = "full" 
     MIXED = "mixed"
 
-
 def get_param_counts(dims: ModelDimensions) -> Dict[str, int]:
     s, h, L, V = dims.s, dims.h, dims.L, dims.V
     return {
@@ -33,11 +32,19 @@ def get_param_counts(dims: ModelDimensions) -> Dict[str, int]:
 
 def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Union[int, List[Tuple[int, ...]]]], bool]]]:
     b, s, h, a, d, L, V = dims.b, dims.s, dims.h, dims.a, dims.d, dims.L, dims.V
+    # input_dims - tensors that need to be moved from HBM to on-chip memory
+    # output-dims - tensors reruned by operation
+    # activation_dims - tensors produced in the forward pass that are needed in the backward pass to compute gradients. 
     return {
         'embeddings_sum': {
             'forward': {
                 'flops': 2 * b * s * h,
-                'input_dims': [(b, s, h), (s, h)]
+                'input_dims': [(b, s, h), (s, h)],
+                'output_dims': [(b, s, h)], #output
+                'activation_dims': {
+                    'fp32': [], # no tensor needed for backward pass 
+                    'fp16': [] # n/a - both tensors are fp32
+                } 
             },
             'backward': {
                 'flops': 0, #no flops involved or just assignment
@@ -49,11 +56,16 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
         'pre_attn_layer_norm': {
             'forward': {
                 'flops': 5 * b * s * h,
-                'input_dims': [(b, s, h), (b, s), (b, s), (h,), (h,)]
+                'input_dims': [(b, s, h), (b, s), (b, s), (h,), (h,)], #input, mean, variance, gamma (param), beta (param)
+                'output_dims': [(b, s, h)], #output
+                'activation_dims': {
+                    'fp32': [(b, s, h), (b,s), (b,s)], #input, mean, variance
+                    'fp16': [] #n/a - only done fp32
+                }
             },
             'backward': {
                 'flops': 14 * b * s * h,
-                'input_dims': [(b, s, h), (b, s, h), (b, s), (b, s), (h,), (h,)]
+                'input_dims': [(b, s, h), (b, s, h), (b, s), (b, s), (h,), (h,)] #output.grad, input, mean, variance, gamma (param), beta (param)
             },
             'is_matmul': False,
             'is_per_layer': True        
@@ -61,11 +73,16 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
         'qkv_proj': {
             'forward': {
                 'flops': 6 * b * s * h ** 2,
-                'input_dims': [(b, s, h), (h, 3 * h)],
+                'input_dims': [(b, s, h), (h, 3 * h)], #input, weight
+                'output_dims': [(b, s, 3*h)], #output
+                'activation_dims': {
+                    'fp32': [(b, s, h)], #input
+                    'fp16': [(b, s, h), (h, 3 * h)] #input, weight
+                }
             },
             'backward': {
                 'flops': 12 * b * s * h ** 2,
-                'input_dims': [(b, s, 3 * h), (b, s, 3 * h), (b, s, h), (h, h)],
+                'input_dims': [(b, s, 3 * h), (b, s, 3 * h), (b, s, h), (h, h)], #output.grad, output.grad, input, weight
             },
             'is_matmul': True,
             'is_per_layer': True
@@ -73,23 +90,33 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
         'qkT': {
             'forward': {
                 'flops': 2 * b * a * s ** 2 * d,
-                'input_dims': [(b, a, s, d), (b, a, d, s)]
+                'input_dims': [(b, a, s, d), (b, a, d, s)], #input (copy of q slice), input (copy of k slice)
+                'output_dims': [(b, a, s, s)], #output
+                'activation_dims': {
+                    'fp32': [(b, a, s, d), (b, a, d, s)], #input (copy of q slice), input (copy of k slice)
+                    'fp16': [(b, a, s, d), (b, a, d, s)] #input (copy of q slice), input (copy of k slice)
+                }
             },
             'backward': {
                 'flops': 4 * b * a * s ** 2 * d,
-                'input_dims': [(b, a, s, s), (b, a, s, s), (b, a, s, d), (b, a, d, s)]
+                'input_dims': [(b, a, s, s), (b, a, s, s), (b, a, s, d), (b, a, d, s)] #output.grad, output.grad, input (copy of q slice), input (copy of k slice)
             },
             'is_matmul': True,
             'is_per_layer': True
         },
         'scaling': {
             'forward': {
-                'flops': b * a * s ** 2,
-                'input_dims': [(b, a, s, s)]
+                'flops': b * a * s ** 2, 
+                'input_dims': [(b, a, s, s)], #input
+                'output_dims': [(b, a, s, s)], #output
+                'activation_dims': {
+                    'fp32': [], # no tensor needed for backward pass
+                    'fp16': [] # no tensor needed for backward pass
+                }
             },
             'backward': {
                 'flops': b * a * s ** 2,
-                'input_dims': [(b, a, s, s)]
+                'input_dims': [(b, a, s, s)] #output.grad
             },
             'is_matmul': False,
             'is_per_layer': True
@@ -97,11 +124,16 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
         'softmax': {
             'forward': {
                 'flops': 5 * b * a * s ** 2, #assumes finding max involves O(n) flops
-                'input_dims': [(b, a, s, s)],
+                'input_dims': [(b, a, s, s)], #input
+                'output_dims': [(b, a, s, s)], #output
+                'activation_dims': {
+                    'fp32': [(b, a, s, s)], #output
+                    'fp16': [] #n/a - only done fp32
+                }
             },
             'backward': {
                 'flops': 4 * b * a * s ** 2,
-                'input_dims': [(b, a, s, s), (b, a, s, s)]
+                'input_dims': [(b, a, s, s), (b, a, s, s)] #ouput.grad, output
             },
             'is_matmul': False,
             'is_per_layer': True
@@ -109,11 +141,16 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
         'att_mm_v': {
             'forward': {
                 'flops': 2 * b * a * s ** 2 * d,
-                'input_dims': [(b, a, s, s), (b, a, s, d)],
+                'input_dims': [(b, a, s, s), (b, a, s, d)], #input, #input (copy of v slice)
+                'output_dims': [(b, a, s, d)], #output
+                'activation_dims': {
+                    'fp32': [(b, a, s, d)], #input (copy of v slice) only
+                    'fp16': [(b, a, s, s), (b, a, s, d)] #input (need fp16 copy of softmax output), #input (copy of v slice)
+                }
             },
             'backward': {
                 'flops': 4 * b * a * s ** 2 * d,
-                'input_dims': [(b, a, s, d), (b, a, s, d), (b, a, d, s), (b, a, s, s)] 
+                'input_dims': [(b, a, s, d), (b, a, s, d), (b, a, d, s), (b, a, s, s)] #output.grad, output.grad, input, input (copy of v slice)
             },
             'is_matmul': True,
             'is_per_layer': True
@@ -121,12 +158,16 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
         'output_proj': {
             'forward': {
                 'flops': 2 * b * s * h ** 2,
-                'input_dims': [(b, s, h), (h, h)],
-
+                'input_dims': [(b, s, h), (h, h)], #input, weight
+                'output_dims': [(b, s, h)], #output
+                'activation_dims': {
+                    'fp32': [(b, s, h)], #input
+                    'fp16': [(b, s, h), (h, h)] #input, weight
+                }
             },
             'backward': {
                 'flops': 4 * b * s * h ** 2,
-                'input_dims': [(b, s, h), (b, s, h), (b, s, h), (h, h)] 
+                'input_dims': [(b, s, h), (b, s, h), (b, s, h), (h, h)] #output.grad, output.grad, input, weight
             },
             'is_matmul': True,
             'is_per_layer': True
@@ -134,7 +175,12 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
         'post_attn_residual': {
             'forward' : {
                 'flops': b * s * h,
-                'input_dims': [(b, s, h), (b, s, h)]
+                'input_dims': [(b, s, h), (b, s, h)],
+                'output_dims': [(b, s, h)], #output
+                'activation_dims': {
+                    'fp32': [], # no tensor needed for backward pass
+                    'fp16': [] # n/a - at least 1 tensor is fp32 irrespective of full precision or mixed precision training
+                }
             },
             'backward': {
                 'flops': 0,
@@ -146,11 +192,16 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
         'pre_mlp_layer_norm': {
             'forward': {
                 'flops': 5 * b * s * h,
-                'input_dims': [(b, s, h), (b, s), (b, s), (h,), (h,)],
+                'input_dims': [(b, s, h), (b, s), (b, s), (h,), (h,)], #input, mean, variance, gamma (param), beta (param)
+                'output_dims': [(b, s, h)], #output
+                'activation_dims': {
+                    'fp32': [(b, s, h), (b,s), (b,s)], #input, mean, variance
+                    'fp16': [] #n/a - only done fp32
+                }
             },
             'backward': {
                 'flops': 14 * b * s * h,
-                'input_dims': [(b, s, h), (b, s, h), (b, s), (b, s), (h,), (h,)]
+                'input_dims': [(b, s, h), (b, s, h), (b, s), (b, s), (h,), (h,)] #output.grad, input, mean, variance, gamma (param), beta (param)
             },
             'is_matmul': False,
             'is_per_layer': True
@@ -158,11 +209,16 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
         'mlp_up_proj': {
             'forward': {
                 'flops': 8 * b * s * h ** 2,
-                'input_dims': [(b, s, h), (h, 4 * h)]
+                'input_dims': [(b, s, h), (h, 4 * h)], #input, weight
+                'output_dims': [(b, s, 4*h)], #output
+                'activation_dims': {
+                    'fp32': [(b, s, h)], #input
+                    'fp16': [(b, s, h), (h, 4*h)] #input, weight
+                }
             },
             'backward': {
                 'flops': 16 * b * s * h ** 2,
-                'input_dims': [(b, s, 4 * h), (b, s, 4 * h), (b, s, h), (h, h)]
+                'input_dims': [(b, s, 4 * h), (b, s, 4 * h), (b, s, h), (h, h)] #output.grad, output.grad, input, weight
             },
             'is_matmul': True,
             'is_per_layer': True
@@ -170,11 +226,16 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
         'gelu': {
             'forward': {
                 'flops': 32 * b * s * h,
-                'input_dims': [(b, s, 4 * h)],
+                'input_dims': [(b, s, 4 * h)], #input
+                'output_dims': [(b, s, 4*h)], #output
+                'activation_dims': {
+                    'fp32': [(b, s, 4*h)], #input
+                    'fp16': [(b, s, 4*h)] #input
+                }
             },
             'backward': {
                 'flops': 72 * b * s * h,
-                'input_dims': [(b, s, 4 * h), (b, s, 4 * h)]
+                'input_dims': [(b, s, 4 * h), (b, s, 4 * h)] #output.grad, input
             },
             'is_matmul': False,
             'is_per_layer': True
@@ -182,11 +243,16 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
         'mlp_down_proj': {
             'forward': {
                 'flops': 8 * b * s * h ** 2,
-                'input_dims': [(b, s, 4 * h), (4 * h, h)]
+                'input_dims': [(b, s, 4 * h), (4 * h, h)], #input, weight
+                'output_dims': [(b, s, h)], #output
+                'activation_dims': {
+                    'fp32': [(b, s, 4*h)], #input
+                    'fp16': [(b, s, 4*h), (h, 4*h)] #input, weight
+                }
             },
             'backward': {
                 'flops': 16 * b * s * h ** 2,
-                'input_dims': [(b, s, h), (b, s, h), (4 * h, h), (b, s, 4 * h)]
+                'input_dims': [(b, s, h), (b, s, h), (b, s, 4 * h), (4 * h, h)] #output.grad, output.grad, input, weight
             },
             'is_matmul': True,
             'is_per_layer': True
@@ -194,7 +260,12 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
         'post_mlp_residual': {
             'forward' : {
                 'flops': b * s * h,
-                'input_dims': [(b, s, h), (b, s, h)]
+                'input_dims': [(b, s, h), (b, s, h)],
+                'output_dims': [(b, s, h)], #output
+                'activation_dims': {
+                    'fp32': [], # no tensor needed for backward pass
+                    'fp16': [] # n/a - at least 1 tensor is fp32 irrespective of full precision or mixed precision training
+                }
             },
             'backward': {
                 'flops': 0,
@@ -206,11 +277,16 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
         'final_layer_norm': {
             'forward': {
                 'flops': 5 * b * s * h,
-                'input_dims': [(b, s, h), (b, s), (b, s), (h,), (h,)],
+                'input_dims': [(b, s, h), (b, s), (b, s), (h,), (h,)],#input, mean, variance, gamma (param), beta (param)
+                'output_dims': [(b, s, h)], #output
+                'activation_dims': {
+                    'fp32': [(b, s, h), (b,s), (b,s)], #input, mean, variance
+                    'fp16': [] #n/a - only done fp32
+                }
             },
             'backward': {
                 'flops': 14 * b * s * h,
-                'input_dims': [(b, s, h), (b, s, h), (b, s), (b, s), (h,), (h,)]
+                'input_dims': [(b, s, h), (b, s, h), (b, s), (b, s), (h,), (h,)]#output.grad, input, mean, variance, gamma (param), beta (param)
             },
             'is_matmul': False,
             'is_per_layer': False
@@ -218,68 +294,51 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
         'lm_head': {
             'forward': {
                 'flops': 2 * b * s * h * V,
-                'input_dims': [(b, s, h), (h, V)],
+                'input_dims': [(b, s, h), (h, V)], #input, weight
+                'output_dims': [(b, s, V)], #output
+                'activation_dims': {
+                    'fp32': [(b, s, h)], #input
+                    'fp16': [(b, s, h), (h,V)] #input, weight
+                }
             },
             'backward': {
                 'flops': 4 * b * s * h * V,
-                'input_dims': [(b, s, V), (b, s, V), (b, s, h), (h, V)]
+                'input_dims': [(b, s, V), (b, s, V), (b, s, h), (h, V)] #output.grad, output.grad, input, weight
             },
             'is_matmul': True,
             'is_per_layer': False
         },
-        'cross_entropy': { #just considering log_softmax, not log_softmax + nllloss
+        'log_softmax': {
             'forward': {
                 'flops': 5 * b * s * V,
-                'input_dims': [(b, s, V)]
+                'input_dims': [(b, s, V)], #input
+                'output_dims': [(b, s, V)], #output
+                'activation_dims': {
+                    'fp32': [(b,s, V)], #output
+                    'fp16': [] #n/a - only done fp32
+                }
             },
             'backward': {
                 'flops': 4 * b * s * V,
-                'input_dims': [(b, s, V), (b, s, V)]
+                'input_dims': [(b, s, V), (b, s, V)] #output.grad, output
             },
             'is_matmul': False,
             'is_per_layer': False
         }
     }
-
-# def get_param_memory(dims: ModelDimensions, precision: PrecisionType) -> Dict[str, int]:
-#     param_counts = get_param_counts(dims)
-#     bytes_per_element = 4
-#     param_memory = {
-#         name: count * bytes_per_element 
-#         for name, count in param_counts.items()
-#     }
-#     return param_memory
-
-def get_forward_backward_input_memory(dims: ModelDimensions, precision: PrecisionType) -> Dict[str, Dict[str, int]]:
-    ops = get_gpt_ops(dims)
-
-    input_memory = {}
-    for name, op_info in ops.items():
-        fwd_count = sum(math.prod(dim) for dim in op_info['forward']['input_dims'])
-        bwd_count = sum(math.prod(dim) for dim in op_info['backward']['input_dims'])
-
-        bytes_per_element = 2 if precision == PrecisionType.MIXED and op_info['is_matmul'] else 4
-
-        input_memory[name] = {
-            'forward': fwd_count * bytes_per_element,
-            'backward': bwd_count * bytes_per_element
-        }
-    return input_memory
     
-def get_dynamically_allocated_memory_fwd_pass(dims: ModelDimensions, precision: PrecisionType) -> Dict[str, int]:
+def get_activation_memory(dims: ModelDimensions, precision: PrecisionType) -> Dict[str, int]:
     ops = get_gpt_ops(dims)
-    input_memory = get_forward_backward_input_memory(dims, precision)
-    single_layer_dims = ModelDimensions(dims.a, dims.b, dims.d, dims.h, 1, dims.s, dims.V)
-    param_counts = get_param_counts(single_layer_dims)
+    activation_memory = {}
+    for name, op_info in ops.items():
+        fp_16_count = sum(math.prod(dim) for dim in op_info['forward']['activation_dims']['fp16'])
+        fp_32_count = sum(math.prod(dim) for dim in op_info['forward']['activation_dims']['fp32'])
+        if precision == PrecisionType.FULL or (precision == PrecisionType.MIXED and fp_16_count == 0):
+            activation_memory[name] = fp_32_count * 4
+        else:
+            activation_memory[name] = fp_16_count * 2
+    return activation_memory
 
-    allocated_memory = {}
-    for name, mems in input_memory.items():
-        allocated_memory[name] = mems['forward']
-        # param copy is not taken for full precision training or operations that autocast to single-precision during mixed preicsion training
-        if precision == PrecisionType.FULL or (precision == PrecisionType.MIXED and not ops[name]['is_matmul']): 
-            allocated_memory[name] -= param_counts.get(name, 0) * 4
-
-    return allocated_memory
 
 def calculate_peak_memory(dims: ModelDimensions, precision: PrecisionType) -> float:
     param_counts = get_param_counts(dims)    
@@ -289,174 +348,37 @@ def calculate_peak_memory(dims: ModelDimensions, precision: PrecisionType) -> fl
     gradient_mem = 4 * P # assumes scheme under which grads persists like gradient accumulation
     optimizer_mem = 8 * P
     buffer_mem = 4 * (dims.s ** 2) * dims.L
-
     statically_allocated_mem = param_mem + gradient_mem + optimizer_mem + buffer_mem
-    dynamically_allocated_mem = sum(get_dynamically_allocated_memory_fwd_pass(dims, precision).values())
-
+    
+    activation_mem = get_activation_memory(dims, precision)
+    ops = get_gpt_ops(dims)
+    dynamically_allocated_mem = 0
+    for name, mem in activation_mem.items():
+        dynamically_allocated_mem += mem * (dims.L if ops[name]['is_per_layer'] else 1)
+    
     peak_mem_gb = (statically_allocated_mem + dynamically_allocated_mem) / (2**30)
-
+    
     return peak_mem_gb
-
-def estimate_mops_latency(dims: ModelDimensions, precision: PrecisionType, accelerator: str) -> Dict[str, Dict[str, float]]:
-    input_memory = get_forward_backward_input_memory(dims, precision)
-    
-    memory_bandwidths = {
-        "H100": 3.35e12,
-        "A100": 1555e9
-    }
-    memory_bandwidth = memory_bandwidths[accelerator]
-
-    latencies = {
-        name: {
-            'forward': mems['forward'] / memory_bandwidth,
-            'backward': mems['backward'] / memory_bandwidth
-        }
-        for name, mems in input_memory.items()
-    }
-
-    return latencies
-
-def estimate_flops_latency(dims: ModelDimensions, precision: PrecisionType, accelerator: str, efficiency: float = 0.8) -> Dict[str, Dict[str, float]]:
-    ops = get_gpt_ops(dims)
-
-    throughputs = {
-        "H100": {
-            "cuda": 67e12,
-            "tensor": {
-                PrecisionType.FULL: 989e12,
-                PrecisionType.MIXED: 1979e12,
-            }
-        },
-        "A100": {
-            "cuda": 19.5e12,
-            "tensor": {
-                PrecisionType.FULL: 156e12,
-                PrecisionType.MIXED: 312e12,
-            }
-        }
-    }
-
-    cuda_core_throughput = throughputs[accelerator]['cuda']
-    tensor_core_throughput = throughputs[accelerator]['tensor'][precision]
-
-    latencies = {}
-    for name, op_info in ops.items():
-        if op_info['is_matmul']:
-            fwd_latency = op_info['forward']['flops'] / (tensor_core_throughput * efficiency)
-            bwd_latency = op_info['backward']['flops'] / (tensor_core_throughput * efficiency)
-        else:
-            fwd_latency = op_info['forward']['flops'] / (cuda_core_throughput * efficiency)
-            bwd_latency = op_info['backward']['flops'] / (cuda_core_throughput * efficiency)
-
-        latencies[name] = {
-            'forward': fwd_latency,
-            'backward': bwd_latency
-        }
-    return latencies
-
-def estimate_combined_latency(dims: ModelDimensions, precision: PrecisionType, accelerator: str, efficiency: float = 0.8) -> Dict[str, Dict[str, float]]:
-    mops_latency = estimate_mops_latency(dims, precision, accelerator)
-    flops_latency = estimate_flops_latency(dims, precision, accelerator, efficiency)
-
-    latencies = {}
-    for op in mops_latency.keys():
-        fwd_latency = max(mops_latency[op]['forward'], flops_latency[op]['forward'])
-        bwd_latency = max(mops_latency[op]['backward'], flops_latency[op]['backward'])
-
-        latencies[op] = {
-            'forward': fwd_latency,
-            'backward': bwd_latency
-        }
-
-    return latencies
-
-def estimate_total_time(dims: ModelDimensions, precision: PrecisionType, acclerator: str, efficiency: float = 0.8) -> Dict[str, float]:
-    latency = estimate_combined_latency(dims, precision, acclerator, efficiency)
-    ops = get_gpt_ops(dims)
-
-    layer_ops = {name for name, op_info in ops.items() if op_info['is_per_layer']}
-    total_time_fwd = total_time_bwd = 0
-    for name, op_latency in latency.items():
-        if name in layer_ops:
-            total_time_fwd += op_latency['forward'] * dims.L 
-            total_time_bwd += op_latency['backward'] * dims.L
-        else:
-            total_time_fwd += op_latency['forward']
-            total_time_bwd += op_latency['backward']
-
-    return {'forward': total_time_fwd, 'backward': total_time_bwd}   
-
-def estimate_aggregate_flops(dims: ModelDimensions, precision: PrecisionType) -> Dict[str, float]:
-    ops = get_gpt_ops(dims)
-
-    matmul_flops_fwd = other_flops_fwd = matmul_flops_bwd = other_flops_bwd = 0
-    for name, op_info in ops.items():
-        multiplier = dims.L if op_info['is_per_layer'] else 1
-        if op_info['is_matmul']:
-            matmul_flops_fwd += op_info['forward']['flops'] * multiplier
-            matmul_flops_bwd += op_info['backward']['flops'] * multiplier
-
-        else:
-            other_flops_fwd += op_info['forward']['flops'] * multiplier
-            other_flops_bwd += op_info['backward']['flops'] * multiplier
-
-    return {
-        'matmul_flops_forward': matmul_flops_fwd,
-        'other_flops_forward': other_flops_fwd,
-        'matmul_flops_backward': matmul_flops_bwd,
-        'other_flops_backward': other_flops_bwd
-    }
-
-def estimate_intra_node_gradient_communication_time(dims: ModelDimensions, accelerator:str, num_gpus: int) -> float:
-    total_gradients = sum(get_param_counts(dims).values())
-    data_size = total_gradients * 4
-
-    nvlink_unidirectional_bandwidths = {
-        "H100": 450e9,
-        "A100": 300e9
-    }
-    nvlink_latency = 0
-    
-    communication_time = 2 * (num_gpus - 1) * (nvlink_latency + data_size / (num_gpus * nvlink_unidirectional_bandwidths[accelerator]))
-
-    return communication_time
-
-
-# def format_number(num):
-#     if num >= 1e12:
-#         return f"{num/1e12:.2f}T"
-#     elif num >= 1e9:
-#         return f"{num/1e9:.2f}B"
-#     elif num >= 1e6:
-#         return f"{num/1e6:.2f}M"
-#     else:
-#         return f"{num:.2f}"
 
 def main():
     models = [
         ("125M", 12, 12, 768),
-        ("350M", 24, 16, 1024),
-        ("1.3B", 24, 32, 2048),
-        ("2.7B", 32, 32, 2560),
-        ("6.7B", 32, 32, 4096),
-        ("13B", 40, 40, 5120), #GPT-3 paper says 5140
-        ("30B", 48, 56, 7168),
-        ("66B", 64, 72, 9216),
-        ("175B", 96, 96, 12288),
+        # ("350M", 24, 16, 1024),
+        # ("1.3B", 24, 32, 2048),
+        # ("2.7B", 32, 32, 2560),
+        # ("6.7B", 32, 32, 4096),
+        # ("13B", 40, 40, 5120), #GPT-3 paper says 5140
+        # ("30B", 48, 56, 7168),
+        # ("66B", 64, 72, 9216),
+        # ("175B", 96, 96, 12288),
     ]
 
-    BATCH_SIZE = 1
+    BATCH_SIZE = 12
     SEQ_LENGTH = 1024
     VOCAB_SIZE = 50304
 
-    precision = PrecisionType.FULL
+    precision = PrecisionType.MIXED
     accelerator = "A100"
-
-    # print(f"{'Model':<8} {'Tot FLOPS':<10} {'MM FLOPS':<10} {'Oth FLOPS':<10} "
-    #       f"{'Tot Mem':<10} {'MM Mem':<10} {'Oth Mem':<10} "
-    #       f"{'Tot AI':<8} {'MM AI':<8} {'Oth AI':<8}")
-    # print("-" * 110)
-
 
     for model_name, num_layers, num_heads, hidden_dim in models:
         dims = ModelDimensions(
@@ -469,8 +391,8 @@ def main():
             V=VOCAB_SIZE
         )
 
-        total_time = estimate_total_time(dims, precision, accelerator)
-        print(total_time['forward'] * 1000, total_time['backward'] * 1000)
+        print(model_name, calculate_peak_memory(dims, precision))
+
 
 if __name__ == '__main__':
     main()
