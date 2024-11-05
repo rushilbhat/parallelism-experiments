@@ -84,7 +84,7 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
             },
             'backward': {
                 'flops': 12 * b * s * h ** 2,
-                'input_dims': [(b, s, 3 * h), (b, s, 3 * h), (b, s, h), (h, h)], #output.grad, output.grad, input, weight
+                'input_dims': [(b, s, 3 * h), (b, s, 3 * h), (b, s, h), (h, 3 * h)], #output.grad, output.grad, input, weight
             },
             'is_matmul': True,
             'is_per_layer': True,
@@ -156,7 +156,7 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
             },
             'backward': {
                 'flops': 4 * b * a * s ** 2 * d,
-                'input_dims': [(b, a, s, d), (b, a, s, d), (b, a, d, s), (b, a, s, s)] #output.grad, output.grad, input, input (copy of v slice)
+                'input_dims': [(b, a, s, d), (b, a, s, d), (b, a, s, s), (b, a, s, d)] #output.grad, output.grad, input, input (copy of v slice)
             },
             'is_matmul': True,
             'is_per_layer': True,
@@ -223,12 +223,12 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'output_dims': [(b, s, 4*h)], #output
                 'activation_dims': {
                     'float32': [(b, s, h)], #input
-                    'float16': [(b, s, h), (h, 4*h)] #input, weight
+                    'float16': [(b, s, h), (h, 4 * h)] #input, weight
                 }
             },
             'backward': {
                 'flops': 16 * b * s * h ** 2,
-                'input_dims': [(b, s, 4 * h), (b, s, 4 * h), (b, s, h), (h, h)] #output.grad, output.grad, input, weight
+                'input_dims': [(b, s, 4 * h), (b, s, 4 * h), (b, s, h), (h, 4 * h)] #output.grad, output.grad, input, weight
             },
             'is_matmul': True,
             'is_per_layer': True,
@@ -259,7 +259,7 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 'output_dims': [(b, s, h)], #output
                 'activation_dims': {
                     'float32': [(b, s, 4*h)], #input
-                    'float16': [(b, s, 4*h), (h, 4*h)] #input, weight
+                    'float16': [(b, s, 4*h), (4 * h, h)] #input, weight
                 }
             },
             'backward': {
@@ -410,7 +410,6 @@ def main():
         )
 
         print(model_name, calculate_peak_memory(dims, precision))
-
 
 if __name__ == '__main__':
     main()
