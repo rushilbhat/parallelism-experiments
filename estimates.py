@@ -30,7 +30,7 @@ def get_param_counts(dims: ModelDimensions) -> Dict[str, int]:
         'lm_head': h * V #wte weights shared with lm_head 
     }
 
-def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Union[int, List[Tuple[int, ...]]]], bool]]]:
+def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Union[int, List[Tuple[int, ...]], Dict[str, List[Tuple[int, ...]]]]], bool]]]:
     b, s, h, a, d, L, V = dims.b, dims.s, dims.h, dims.a, dims.d, dims.L, dims.V
     # input_dims - tensors that need to be moved from HBM to on-chip memory
     # output-dims - tensors reruned by operation
@@ -359,6 +359,7 @@ def calculate_peak_memory(dims: ModelDimensions, precision: PrecisionType) -> fl
     peak_mem_gb = (statically_allocated_mem + dynamically_allocated_mem) / (2**30)
     
     return peak_mem_gb
+
 
 def main():
     models = [
