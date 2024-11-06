@@ -344,8 +344,7 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
         }
     }
 
-def get_activation_memory(dims: ModelDimensions, precision: PrecisionType) -> Dict[str, int]:
-    ops = get_gpt_ops(dims)
+def get_activation_memory(ops: Dict, dims: ModelDimensions, precision: PrecisionType) -> Dict[str, int]:
     activation_memory = {}
     for name, op_info in ops.items():
         float32_count = sum(math.prod(dim) for dim in op_info['forward']['activation_dims']['float32'])
@@ -357,7 +356,7 @@ def get_activation_memory(dims: ModelDimensions, precision: PrecisionType) -> Di
     return activation_memory
 
 
-def calculate_peak_memory(dims: ModelDimensions, precision: PrecisionType) -> float:
+def calculate_peak_memory(ops: Dict, dims: ModelDimensions, precision: PrecisionType) -> float:
     param_counts = get_param_counts(dims)    
     P = sum(param_counts.values())
     
@@ -367,8 +366,7 @@ def calculate_peak_memory(dims: ModelDimensions, precision: PrecisionType) -> fl
     buffer_mem = 4 * (dims.s ** 2) * dims.L
     statically_allocated_mem = param_mem + gradient_mem + optimizer_mem + buffer_mem
     
-    activation_mem = get_activation_memory(dims, precision)
-    ops = get_gpt_ops(dims)
+    activation_mem = get_activation_memory(ops, dims, precision)
     dynamically_allocated_mem = 0
     for name, mem in activation_mem.items():
         dynamically_allocated_mem += mem * (dims.L if ops[name]['is_per_layer'] else 1)
@@ -377,8 +375,7 @@ def calculate_peak_memory(dims: ModelDimensions, precision: PrecisionType) -> fl
     
     return peak_mem_gb
 
-def get_input_memory(dims: ModelDimensions, precision: PrecisionType) -> Dict[str, Dict[str, int]]:
-    ops = get_gpt_ops(dims)
+def get_input_memory(ops: Dict, dims: ModelDimensions, precision: PrecisionType) -> Dict[str, Dict[str, int]]:
     input_memory = {}
 
     for name, op_info in ops.items():
@@ -393,8 +390,8 @@ def get_input_memory(dims: ModelDimensions, precision: PrecisionType) -> Dict[st
         }
     return input_memory
 
-def estimate_mops_latency(dims: ModelDimensions, precision: PrecisionType, accelerator: str) -> Dict[str, Dict[str, float]]:
-    input_memory = get_input_memory(dims, precision)
+def estimate_mops_latency(ops: Dict, dims: ModelDimensions, precision: PrecisionType, accelerator: str) -> Dict[str, Dict[str, float]]:
+    input_memory = get_input_memory(ops, dims, precision)
     
     memory_bandwidths = {
         "H100": 3.35e12,
@@ -413,8 +410,7 @@ def estimate_mops_latency(dims: ModelDimensions, precision: PrecisionType, accel
     return latencies
 
 
-def estimate_flops_latency(dims: ModelDimensions, precision: PrecisionType, accelerator: str, efficiency: float = 0.8) -> Dict[str, Dict[str, float]]:
-    ops = get_gpt_ops(dims)
+def estimate_flops_latency(ops: Dict, dims: ModelDimensions, precision: PrecisionType, accelerator: str, efficiency: float = 0.8) -> Dict[str, Dict[str, float]]:
 
     throughputs = {
         "H100": {
@@ -457,9 +453,9 @@ def estimate_flops_latency(dims: ModelDimensions, precision: PrecisionType, acce
         }
     return latencies
 
-def estimate_combined_latency(dims: ModelDimensions, precision: PrecisionType, accelerator: str, efficiency: float = 0.8) -> Dict[str, Dict[str, float]]:
-    mops_latency = estimate_mops_latency(dims, precision, accelerator)
-    flops_latency = estimate_flops_latency(dims, precision, accelerator, efficiency)
+def estimate_combined_latency(ops: Dict, dims: ModelDimensions, precision: PrecisionType, accelerator: str, efficiency: float = 0.8) -> Dict[str, Dict[str, float]]:
+    mops_latency = estimate_mops_latency(ops, dims, precision, accelerator)
+    flops_latency = estimate_flops_latency(ops, dims, precision, accelerator, efficiency)
 
     latencies = {}  
     for name in mops_latency.keys():
@@ -501,8 +497,12 @@ def main():
             s=SEQ_LENGTH,
             V=VOCAB_SIZE
         )
+        ops = get_gpt_ops(dims)
+
 
         # print(model_name, calculate_peak_memory(dims, precision))
+        for name, lats in estimate_combined_latency(ops, dims, precision, accelerator, efficiency=1).items():
+            print(model_name, name, lats['forward'], lats['backward'])
 
 if __name__ == '__main__':
     main()
