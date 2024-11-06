@@ -348,8 +348,8 @@ def get_activation_memory(dims: ModelDimensions, precision: PrecisionType) -> Di
     ops = get_gpt_ops(dims)
     activation_memory = {}
     for name, op_info in ops.items():
-        float16_count = sum(math.prod(dim) for dim in op_info['forward']['activation_dims']['float16'])
         float32_count = sum(math.prod(dim) for dim in op_info['forward']['activation_dims']['float32'])
+        float16_count = sum(math.prod(dim) for dim in op_info['forward']['activation_dims']['float16'])
         if precision == PrecisionType.FULL or (precision == PrecisionType.MIXED and op_info['autocasts_to_float32']):
             activation_memory[name] = float32_count * 4
         else:
@@ -377,6 +377,99 @@ def calculate_peak_memory(dims: ModelDimensions, precision: PrecisionType) -> fl
     
     return peak_mem_gb
 
+def get_input_memory(dims: ModelDimensions, precision: PrecisionType) -> Dict[str, Dict[str, int]]:
+    ops = get_gpt_ops(dims)
+    input_memory = {}
+
+    for name, op_info in ops.items():
+        fwd_count = sum(math.prod(dim) for dim in op_info['forward']['input_dims'])
+        bwd_count = sum(math.prod(dim) for dim in op_info['backward']['input_dims'])
+
+        bytes_per_element = 4 if precision == PrecisionType.FULL or (precision == PrecisionType.MIXED and op_info['autocasts_to_float32']) else 2
+        
+        input_memory[name] = {
+            'forward': fwd_count * bytes_per_element,
+            'backward': bwd_count * bytes_per_element
+        }
+    return input_memory
+
+def estimate_mops_latency(dims: ModelDimensions, precision: PrecisionType, accelerator: str) -> Dict[str, Dict[str, float]]:
+    input_memory = get_input_memory(dims, precision)
+    
+    memory_bandwidths = {
+        "H100": 3.35e12,
+        "A100": 1555e9
+    }
+    memory_bandwidth = memory_bandwidths[accelerator]
+
+    latencies = {
+        name: {
+            'forward': mems['forward'] / memory_bandwidth,
+            'backward': mems['backward'] / memory_bandwidth
+        }
+        for name, mems in input_memory.items()
+    }
+
+    return latencies
+
+
+def estimate_flops_latency(dims: ModelDimensions, precision: PrecisionType, accelerator: str, efficiency: float = 0.8) -> Dict[str, Dict[str, float]]:
+    ops = get_gpt_ops(dims)
+
+    throughputs = {
+        "H100": {
+            "cuda": {
+                'fp32': 67e12,
+                'bf16': 134e12, #same as fp16
+            },
+            "tensor": {
+                'tf32': 495e12,
+                'bf16': 989e12, #same as fp16
+            }
+        },
+        "A100": {
+            "cuda": {
+                'fp32': 19.5e12,
+                'bf16': 39e12, #note: not the same as fp16 (=78e12)
+            },
+            "tensor": {
+                'tf32': 156e12,
+                'bf16': 312e12, #same as fp16
+            }
+        }
+    }
+
+    latencies = {}
+    for name, op_info in ops.items():
+        if op_info['is_matmul']:
+            throughput = throughputs[accelerator]['tensor']['tf32' if precision == PrecisionType.FULL else 'bf16']
+        elif op_info['autocasts_to_float32']:
+            throughput = throughputs[accelerator]['cuda']['fp32']
+        else:
+            throughput = throughputs[accelerator]['cuda']['fp32' if precision == PrecisionType.FULL else 'bf16']
+
+        fwd_latency = op_info['forward']['flops'] / (throughput * efficiency)
+        bwd_latency = op_info['backward']['flops'] / (throughput * efficiency)
+
+        latencies[name] = {
+            'forward': fwd_latency,
+            'backward': bwd_latency
+        }
+    return latencies
+
+def estimate_combined_latency(dims: ModelDimensions, precision: PrecisionType, accelerator: str, efficiency: float = 0.8) -> Dict[str, Dict[str, float]]:
+    mops_latency = estimate_mops_latency(dims, precision, accelerator)
+    flops_latency = estimate_flops_latency(dims, precision, accelerator, efficiency)
+
+    latencies = {}  
+    for name in mops_latency.keys():
+        fwd_latency = max(mops_latency[name]['forward'], flops_latency[name]['forward'])
+        bwd_latency = max(mops_latency[name]['backward'], flops_latency[name]['backward'])
+        latencies[name] = {
+            'forward': fwd_latency,
+            'backward': bwd_latency
+        }
+    return latencies
 
 def main():
     models = [
@@ -409,7 +502,7 @@ def main():
             V=VOCAB_SIZE
         )
 
-        print(model_name, calculate_peak_memory(dims, precision))
+        # print(model_name, calculate_peak_memory(dims, precision))
 
 if __name__ == '__main__':
     main()
