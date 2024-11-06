@@ -467,6 +467,15 @@ def estimate_combined_latency(ops: Dict, dims: ModelDimensions, precision: Preci
         }
     return latencies
 
+def estimate_total_time(ops: Dict, dims: ModelDimensions, precision: PrecisionType, accelerator: str, efficiency: float = 0.8) -> Dict[str, float]:
+    latency = estimate_combined_latency(ops, dims, precision, accelerator, efficiency)
+    total_time_fwd = total_time_bwd = 0
+    for name, op_latency in latency.items():
+        total_time_fwd += op_latency['forward'] * (dims.L if ops[name]['is_per_layer'] else 1)
+        total_time_bwd += op_latency['backward'] * (dims.L if ops[name]['is_per_layer'] else 1)
+
+    return {'forward': total_time_fwd, 'backward': total_time_bwd}
+
 def main():
     models = [
         ("125M", 12, 12, 768),
@@ -501,8 +510,12 @@ def main():
 
 
         # print(model_name, calculate_peak_memory(dims, precision))
-        for name, lats in estimate_combined_latency(ops, dims, precision, accelerator, efficiency=1).items():
-            print(model_name, name, lats['forward'], lats['backward'])
+        total_time = 0
+        for name, lats in estimate_combined_latency(ops, dims, precision, accelerator, efficiency=0.8).items():
+            total_time += lats['backward']*1000
+            print(model_name, name, lats['backward']*1000)
+            # print(model_name, name, lats['forward'], lats['backward'])
+        print(model_name, total_time)
 
 if __name__ == '__main__':
     main()
