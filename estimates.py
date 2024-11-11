@@ -57,7 +57,7 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
         'pre_attn_layer_norm': {
             'forward': {
                 'flops': 5 * b * s * h,
-                'input_dims': [(b, s, h), (b, s), (b, s), (h,), (h,)], #input, mean, variance, gamma (param), beta (param)
+                'input_dims': [(b, s, h), (h,), (h,)], #input, gamma (param), beta (param)
                 'output_dims': [(b, s, h)], #output
                 'activation_dims': {
                     'float32': [(b, s, h), (b,s), (b,s)], #input, mean, variance
@@ -201,7 +201,7 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
         'pre_mlp_layer_norm': {
             'forward': {
                 'flops': 5 * b * s * h,
-                'input_dims': [(b, s, h), (b, s), (b, s), (h,), (h,)], #input, mean, variance, gamma (param), beta (param)
+                'input_dims': [(b, s, h), (h,), (h,)], #input, gamma (param), beta (param)
                 'output_dims': [(b, s, h)], #output
                 'activation_dims': {
                     'float32': [(b, s, h), (b,s), (b,s)], #input, mean, variance
@@ -291,7 +291,7 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
         'final_layer_norm': {
             'forward': {
                 'flops': 5 * b * s * h,
-                'input_dims': [(b, s, h), (b, s), (b, s), (h,), (h,)],#input, mean, variance, gamma (param), beta (param)
+                'input_dims': [(b, s, h), (h,), (h,)], #input, gamma (param), beta (param)
                 'output_dims': [(b, s, h)], #output
                 'activation_dims': {
                     'float32': [(b, s, h), (b,s), (b,s)], #input, mean, variance
@@ -371,7 +371,7 @@ def calculate_peak_memory(ops: Dict, dims: ModelDimensions, precision: Precision
     for name, mem in activation_mem.items():
         dynamically_allocated_mem += mem * (dims.L if ops[name]['is_per_layer'] else 1)
     
-    peak_mem_gb = (statically_allocated_mem + dynamically_allocated_mem) / (2**30)
+    peak_mem_gb = statically_allocated_mem + dynamically_allocated_mem
     
     return peak_mem_gb
 
@@ -489,11 +489,11 @@ def main():
         # ("175B", 96, 96, 12288),
     ]
 
-    BATCH_SIZE = 12
+    BATCH_SIZE = 8
     SEQ_LENGTH = 1024
     VOCAB_SIZE = 50304
 
-    precision = PrecisionType.MIXED
+    precision = PrecisionType.FULL
     accelerator = "A100"
 
     for model_name, num_layers, num_heads, hidden_dim in models:
@@ -509,13 +509,8 @@ def main():
         ops = get_gpt_ops(dims)
 
 
-        # print(model_name, calculate_peak_memory(dims, precision))
-        total_time = 0
-        for name, lats in estimate_combined_latency(ops, dims, precision, accelerator, efficiency=0.8).items():
-            total_time += lats['backward']*1000
-            print(model_name, name, lats['backward']*1000)
-            # print(model_name, name, lats['forward'], lats['backward'])
-        print(model_name, total_time)
+        # print(model_name, calculate_peak_memory(ops, dims, precision))
+        print(model_name, estimate_total_time(ops, dims, precision, accelerator, efficiency=1))
 
 if __name__ == '__main__':
     main()
