@@ -17,26 +17,58 @@ class PrecisionType(Enum):
     FULL = "full" 
     MIXED = "mixed"
 
-def get_param_counts(dims: ModelDimensions) -> Dict[str, int]:
-    s, h, L, V = dims.s, dims.h, dims.L, dims.V
-    return {
-        'wpe': s * h,
-        'qkv_proj': 3 * h ** 2 * L,
-        'output_proj': h ** 2 * L,
-        'mlp_up_proj': 4 * h ** 2 * L,
-        'mlp_down_proj': 4 * h ** 2 * L,
-        'block_layer_norms': 2 * 2 * h * L,
-        'final_layer_norm': 2 * h,
-        'lm_head': h * V #wte weights shared with lm_head 
-    }
+def get_param_counts(ops: Dict, dims: ModelDimensions) -> Dict[str, int]:
+    counts = {}
+    for name, op_info in ops.items():
+        counts[name] = sum(math.prod(param) for param in op_info['params']) * (dims.L if op_info['is_per_layer'] else 1)
+    return counts
 
 def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Union[int, List[Tuple[int, ...]], Dict[str, List[Tuple[int, ...]]]]], bool]]]:
     b, s, h, a, d, L, V = dims.b, dims.s, dims.h, dims.a, dims.d, dims.L, dims.V
     # input_dims - tensors that need to be moved from HBM to on-chip memory
-    # output-dims - tensors reruned by operation
+    # output-dims - tensors returned by operation
     # activation_dims - tensors produced in the forward pass that are needed in the backward pass to compute gradients. 
     return {
+        'wte': {
+            'params': [], #weight shared with lm_head
+            'forward': {
+                'flops': 0,
+                'input_dims': [],
+                'output_dims': [],
+                'activation_dims': {
+                    'float32': [],
+                    'float16': [] 
+                } 
+            },
+            'backward': {
+                'flops': 0, 
+                'input_dims': []
+            },
+            'is_matmul': False,
+            'is_per_layer': False,
+            'autocasts_to_float32': True
+        },
+        'wpe': {
+            'params': [(s, h)],
+            'forward': {
+                'flops': 0,
+                'input_dims': [],
+                'output_dims': [],
+                'activation_dims': {
+                    'float32': [],
+                    'float16': [] 
+                } 
+            },
+            'backward': {
+                'flops': 0, 
+                'input_dims': []
+            },
+            'is_matmul': False,
+            'is_per_layer': False,
+            'autocasts_to_float32': True
+        },
         'embeddings_sum': {
+            'params': [],
             'forward': {
                 'flops': 2 * b * s * h,
                 'input_dims': [(b, s, h), (s, h)],
@@ -55,6 +87,7 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
             'autocasts_to_float32': True
         },
         'pre_attn_layer_norm': {
+            'params': [(h,), (h,)],
             'forward': {
                 'flops': 5 * b * s * h,
                 'input_dims': [(b, s, h), (h,), (h,)], #input, gamma (param), beta (param)
@@ -73,6 +106,7 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
             'autocasts_to_float32': True
         },
         'qkv_proj': {
+            'params': [(h, 3 * h)],
             'forward': {
                 'flops': 6 * b * s * h ** 2,
                 'input_dims': [(b, s, h), (h, 3 * h)], #input, weight
@@ -91,6 +125,7 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
             'autocasts_to_float32': False
         },
         'qkT': {
+            'params': [],
             'forward': {
                 'flops': 2 * b * a * s ** 2 * d,
                 'input_dims': [(b, a, s, d), (b, a, d, s)], #input (copy of q slice), input (copy of k slice)
@@ -109,6 +144,7 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
             'autocasts_to_float32': False
         },
         'scaling': {
+            'params': [],
             'forward': {
                 'flops': b * a * s ** 2, 
                 'input_dims': [(b, a, s, s)], #input
@@ -127,6 +163,7 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
             'autocasts_to_float32': False
         },
         'softmax': {
+            'params': [],
             'forward': {
                 'flops': 5 * b * a * s ** 2, #assumes finding max involves O(n) flops
                 'input_dims': [(b, a, s, s)], #input
@@ -145,6 +182,7 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
             'autocasts_to_float32': True
         },
         'att_mm_v': {
+            'params': [],
             'forward': {
                 'flops': 2 * b * a * s ** 2 * d,
                 'input_dims': [(b, a, s, s), (b, a, s, d)], #input, #input (copy of v slice)
@@ -163,6 +201,7 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
             'autocasts_to_float32': False
         },
         'output_proj': {
+            'params': [(h, h)],
             'forward': {
                 'flops': 2 * b * s * h ** 2,
                 'input_dims': [(b, s, h), (h, h)], #input, weight
@@ -181,6 +220,7 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
             'autocasts_to_float32': False
         },
         'post_attn_residual': {
+            'params': [],
             'forward' : {
                 'flops': b * s * h,
                 'input_dims': [(b, s, h), (b, s, h)],
@@ -199,6 +239,7 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
             'autocasts_to_float32': True
         },
         'pre_mlp_layer_norm': {
+            'params': [(h,), (h,)],
             'forward': {
                 'flops': 5 * b * s * h,
                 'input_dims': [(b, s, h), (h,), (h,)], #input, gamma (param), beta (param)
@@ -217,6 +258,7 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
             'autocasts_to_float32': True
         },
         'mlp_up_proj': {
+            'params': [(h, 4 * h)],
             'forward': {
                 'flops': 8 * b * s * h ** 2,
                 'input_dims': [(b, s, h), (h, 4 * h)], #input, weight
@@ -235,6 +277,7 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
             'autocasts_to_float32': False
         },
         'gelu': {
+            'params': [],
             'forward': {
                 'flops': 32 * b * s * h,
                 'input_dims': [(b, s, 4 * h)], #input
@@ -253,6 +296,7 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
             'autocasts_to_float32': False
         },
         'mlp_down_proj': {
+            'params': [(4 * h, h)],
             'forward': {
                 'flops': 8 * b * s * h ** 2,
                 'input_dims': [(b, s, 4 * h), (4 * h, h)], #input, weight
@@ -271,6 +315,7 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
             'autocasts_to_float32': False
         },
         'post_mlp_residual': {
+            'params': [],
             'forward' : {
                 'flops': b * s * h,
                 'input_dims': [(b, s, h), (b, s, h)],
@@ -289,6 +334,7 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
             'autocasts_to_float32': True
         },
         'final_layer_norm': {
+            'params': [(h,), (h,)],
             'forward': {
                 'flops': 5 * b * s * h,
                 'input_dims': [(b, s, h), (h,), (h,)], #input, gamma (param), beta (param)
@@ -307,6 +353,7 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
             'autocasts_to_float32': True
         },
         'lm_head': {
+            'params': [(h, V)],
             'forward': {
                 'flops': 2 * b * s * h * V,
                 'input_dims': [(b, s, h), (h, V)], #input, weight
@@ -325,6 +372,7 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
             'autocasts_to_float32': False
         },
         'log_softmax': {
+            'params': [],
             'forward': {
                 'flops': 5 * b * s * V,
                 'input_dims': [(b, s, V)], #input
@@ -357,7 +405,7 @@ def get_activation_memory(ops: Dict, dims: ModelDimensions, precision: Precision
 
 
 def calculate_peak_memory(ops: Dict, dims: ModelDimensions, precision: PrecisionType) -> float:
-    param_counts = get_param_counts(dims)    
+    param_counts = get_param_counts(ops, dims)    
     P = sum(param_counts.values())
     
     param_mem = 4 * P
@@ -476,7 +524,7 @@ def estimate_total_time(ops: Dict, dims: ModelDimensions, precision: PrecisionTy
 
     return {'forward': total_time_fwd, 'backward': total_time_bwd}
 
-def estimate_gradient_all_reduce_time(dims: ModelDimensions, accelerator: str, world_size: int):
+def estimate_gradient_all_reduce_time(ops: Dict, dims: ModelDimensions, accelerator: str, world_size: int):
     # base latency + per step latency * no. steps + amount of data / memory bandwidth * no. steps
 
     bandwidths = {
@@ -503,7 +551,7 @@ def estimate_gradient_all_reduce_time(dims: ModelDimensions, accelerator: str, w
 
     latency = baseLat + nIntraSteps * intraLat + nInterSteps * interLat
 
-    total_data = sum(get_param_counts(dims).values()) * 4
+    total_data = sum(get_param_counts(ops, dims).values()) * 4
     effective_bandwidth = bandwidths[accelerator]["inter" if world_size > 1 else "intra"]
     transport_time = nSteps * total_data / (world_size * effective_bandwidth)
     
@@ -545,14 +593,14 @@ def main():
         # statically_allocated_mem, dynamically_allocated_mem = calculate_peak_memory(ops, dims, precision)
         # print(model_name, statically_allocated_mem/2**30, dynamically_allocated_mem/2**30)
         # continue
-        print(model_name, estimate_total_time(ops, dims, precision, accelerator, efficiency=0.8))
+        # print(model_name, estimate_total_time(ops, dims, precision, accelerator, efficiency=0.8))
         # print(estimate_gradient_all_reduce_time(dims, accelerator, 256))
     
-        world_size = batch_size / SEQ_LENGTH
+        # world_size = batch_size / SEQ_LENGTH
     
 
-        latency, transport_time = estimate_gradient_all_reduce_time(dims, accelerator, world_size)
-        print(f"{model_name}: {latency + transport_time:.6f}")
+        # latency, transport_time = estimate_gradient_all_reduce_time(dims, accelerator, world_size)
+        # print(f"{model_name}: {latency + transport_time:.6f}")
 
 
 if __name__ == '__main__':
