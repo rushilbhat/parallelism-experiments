@@ -371,9 +371,9 @@ def calculate_peak_memory(ops: Dict, dims: ModelDimensions, precision: Precision
     for name, mem in activation_mem.items():
         dynamically_allocated_mem += mem * (dims.L if ops[name]['is_per_layer'] else 1)
     
-    peak_mem_gb = statically_allocated_mem + dynamically_allocated_mem
+    peak_mem = statically_allocated_mem + dynamically_allocated_mem
     
-    return peak_mem_gb
+    return peak_mem
 
 def get_input_memory(ops: Dict, dims: ModelDimensions, precision: PrecisionType) -> Dict[str, Dict[str, int]]:
     input_memory = {}
@@ -476,30 +476,64 @@ def estimate_total_time(ops: Dict, dims: ModelDimensions, precision: PrecisionTy
 
     return {'forward': total_time_fwd, 'backward': total_time_bwd}
 
+def estimate_gradient_all_reduce_time(dims: ModelDimensions, accelerator: str, world_size: int):
+    # base latency + per step latency * no. steps + amount of data / memory bandwidth * no. steps
+
+    bandwidths = {
+        "H100": {
+            "inter": 450e9, #unidirectional
+            "intra": 8*48e9 #unidirectional
+        },
+        "A100": {
+            "inter": 300e9, #unidirectional
+            "intra": 8*24e9 #unidirectional
+        }
+    }
+
+    num_gpus_per_node = 8
+    nNodes = math.ceil(world_size / num_gpus_per_node)
+    nSteps = 2 * (world_size - 1)
+    nInterSteps = 2 * nNodes if world_size > 1 else 0
+    nIntraSteps = nSteps - nInterSteps
+    
+    #default values from comm_analysis.py
+    baseLat = 6.6e-6
+    intraLat = 1e-6
+    interLat = 2.7e-6
+
+    latency = baseLat + nIntraSteps * intraLat + nInterSteps * interLat
+
+    total_data = sum(get_param_counts(dims).values()) * 4
+    effective_bandwidth = bandwidths[accelerator]["inter" if world_size > 1 else "intra"]
+    transport_time = nSteps * total_data / (world_size * effective_bandwidth)
+    
+    return latency, transport_time
+    return latency + transport_time
+
 def main():
     models = [
-        ("125M", 12, 12, 768),
-        # ("350M", 24, 16, 1024),
-        # ("1.3B", 24, 32, 2048),
-        # ("2.7B", 32, 32, 2560),
-        # ("6.7B", 32, 32, 4096),
-        # ("13B", 40, 40, 5120), #GPT-3 paper says 5140
+        ("125M", 12, 12, 768, 2**19),
+        ("350M", 24, 16, 1024, 2**19),
+        ("1.3B", 24, 32, 2048, 2**20),
+        ("2.7B", 32, 32, 2560, 2**20),
+        ("6.7B", 32, 32, 4096, 2**21),
+        ("13B", 40, 40, 5120, 2**21), #GPT-3 paper says 5140
         # ("30B", 48, 56, 7168),
         # ("66B", 64, 72, 9216),
-        # ("175B", 96, 96, 12288),
+        ("175B", 96, 96, 12288, 2**21 + 2**20 + 2**16),
     ]
 
-    BATCH_SIZE = 8
-    SEQ_LENGTH = 1024
+    MICRO_BATCH_SIZE = 1
+    SEQ_LENGTH = 2048
     VOCAB_SIZE = 50304
 
-    precision = PrecisionType.FULL
-    accelerator = "A100"
+    precision = PrecisionType.MIXED
+    accelerator = "H100"
 
-    for model_name, num_layers, num_heads, hidden_dim in models:
+    for model_name, num_layers, num_heads, hidden_dim, batch_size in models:
         dims = ModelDimensions(
             a=num_heads,
-            b=BATCH_SIZE,
+            b=MICRO_BATCH_SIZE,
             d=hidden_dim // num_heads,
             h=hidden_dim,
             L=num_layers,
@@ -508,9 +542,18 @@ def main():
         )
         ops = get_gpt_ops(dims)
 
+        # statically_allocated_mem, dynamically_allocated_mem = calculate_peak_memory(ops, dims, precision)
+        # print(model_name, statically_allocated_mem/2**30, dynamically_allocated_mem/2**30)
+        # continue
+        print(model_name, estimate_total_time(ops, dims, precision, accelerator, efficiency=0.8))
+        # print(estimate_gradient_all_reduce_time(dims, accelerator, 256))
+    
+        world_size = batch_size / SEQ_LENGTH
+    
 
-        # print(model_name, calculate_peak_memory(ops, dims, precision))
-        print(model_name, estimate_total_time(ops, dims, precision, accelerator, efficiency=1))
+        latency, transport_time = estimate_gradient_all_reduce_time(dims, accelerator, world_size)
+        print(f"{model_name}: {latency + transport_time:.6f}")
+
 
 if __name__ == '__main__':
     main()
