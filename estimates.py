@@ -20,7 +20,7 @@ class PrecisionType(Enum):
 def get_param_counts(ops: Dict, dims: ModelDimensions) -> Dict[str, int]:
     counts = {}
     for name, op_info in ops.items():
-        counts[name] = sum(math.prod(param) for param in op_info['params']) * (dims.L if op_info['is_per_layer'] else 1)
+        counts[name] = sum(math.prod(param) for param in op_info['params'])
     return counts
 
 def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Union[int, List[Tuple[int, ...]], Dict[str, List[Tuple[int, ...]]]]], bool]]]:
@@ -406,7 +406,7 @@ def get_activation_memory(ops: Dict, dims: ModelDimensions, precision: Precision
 
 def calculate_peak_memory(ops: Dict, dims: ModelDimensions, precision: PrecisionType) -> float:
     param_counts = get_param_counts(ops, dims)    
-    P = sum(param_counts.values())
+    P = sum(count * (dims.L if ops[name]['is_per_layer'] else 1) for name, count in param_counts.items())
     
     param_mem = 4 * P
     gradient_mem = 4 * P # assumes scheme under which grads persists (i.e grads initialised to zero or gradient accumulation
@@ -551,12 +551,14 @@ def estimate_gradient_all_reduce_time(ops: Dict, dims: ModelDimensions, accelera
 
     latency = baseLat + nIntraSteps * intraLat + nInterSteps * interLat
 
-    total_data = sum(get_param_counts(ops, dims).values()) * 4
+    param_counts = get_param_counts(ops, dims)
+    total_data = sum(count * (dims.L if ops[name]['is_per_layer'] else 1) for name, count in param_counts.items()) * 4
     effective_bandwidth = bandwidths[accelerator]["inter" if world_size > 1 else "intra"]
     transport_time = nSteps * total_data / (world_size * effective_bandwidth)
     
     return latency, transport_time
     return latency + transport_time
+
 
 def main():
     models = [
@@ -571,8 +573,8 @@ def main():
         ("175B", 96, 96, 12288, 2**21 + 2**20 + 2**16),
     ]
 
-    MICRO_BATCH_SIZE = 1
-    SEQ_LENGTH = 2048
+    MICRO_BATCH_SIZE = 12
+    SEQ_LENGTH = 1024
     VOCAB_SIZE = 50304
 
     precision = PrecisionType.MIXED
@@ -590,7 +592,8 @@ def main():
         )
         ops = get_gpt_ops(dims)
 
-        # statically_allocated_mem, dynamically_allocated_mem = calculate_peak_memory(ops, dims, precision)
+        peak_mem = calculate_peak_memory(ops, dims, precision)
+        print(model_name, peak_mem/2**30)
         # print(model_name, statically_allocated_mem/2**30, dynamically_allocated_mem/2**30)
         # continue
         # print(model_name, estimate_total_time(ops, dims, precision, accelerator, efficiency=0.8))
