@@ -524,7 +524,7 @@ def estimate_total_time(ops: Dict, dims: ModelDimensions, precision: PrecisionTy
 
     return {'forward': total_time_fwd, 'backward': total_time_bwd}
 
-def estimate_gradient_all_reduce_time(ops: Dict, dims: ModelDimensions, accelerator: str, world_size: int):
+def estimate_all_reduce_time(ops: Dict, dims: ModelDimensions, accelerator: str, world_size: int, comm_volume: int):
     # base latency + per step latency * no. steps + amount of data / memory bandwidth * no. steps
 
     bandwidths = {
@@ -551,13 +551,78 @@ def estimate_gradient_all_reduce_time(ops: Dict, dims: ModelDimensions, accelera
 
     latency = baseLat + nIntraSteps * intraLat + nInterSteps * interLat
 
-    param_counts = get_param_counts(ops, dims)
-    total_data = sum(count * (dims.L if ops[name]['is_per_layer'] else 1) for name, count in param_counts.items()) * 4
     effective_bandwidth = bandwidths[accelerator]["inter" if world_size > 1 else "intra"]
-    transport_time = nSteps * total_data / (world_size * effective_bandwidth)
+    transport_time = nSteps * comm_volume / (world_size * effective_bandwidth)
     
-    return latency, transport_time
     return latency + transport_time
+
+def get_full_ops_list(ops: Dict, dims: ModelDimensions) -> List[str]:
+    ops = list(ops.keys())
+
+    layer_start_idx = next(i for i, op in enumerate(ops) if op == 'pre_attn_layer_norm')
+    layer_end_idx = next(i for i, op in enumerate(ops) if op == 'post_mlp_residual')
+
+    return ops[:layer_start_idx] + ops[layer_start_idx:layer_end_idx+1] * 2 + ops[layer_end_idx+1:] #dims.L
+
+def create_buckets(ops: Dict, dims: ModelDimensions, all_params: List[Tuple[str, Tuple[int, ...]]], bucket_cap: int):
+    non_zero_params = [(name, param) for name, param in all_params if param != (0,)]
+    buckets = [[]]
+    for name, param in reversed(non_zero_params):
+        if sum(math.prod(dim)*4 for _, dim in buckets[-1]) < bucket_cap:
+            buckets[-1].append((name, param))
+        else:
+            buckets.append([(name, param)])
+
+    return buckets #in order of backward pass
+
+# "bucket_cap = 768: (768, 50304), (768,), (768,), (3072, 768), (768, 3072), (768,), (768,), (768, 768), (768, 2304), (768,), (768,), (1024, 768)"
+# "bucket_cap = 768+1 to 768*2: (768, 50304), (768,)+(768,), (3072, 768), (768, 3072), (768,)+(768,), (768, 768), (768, 2304), (768,)+(768,), (1024, 768)"
+# "bucket_cap = 768*2+1 to 768**2+768*2: (768, 50304), (768,)+(768,)+(3072, 768), (768, 3072), (768,)+(768,)+(768, 768), (768, 2304), (768,)+(768,)+(1024, 768)"
+# "bucket_cap = 768**2+768*2+1 to 768*3072: (768, 50304), (768,)+(768,)+(3072, 768), (768, 3072), (768,)+(768,)+(768, 768)+(768, 2304), (768,)+(768,)+(1024, 768)"
+# "bucket_cap = 768*3072+1 to 768+768*3072 == 768+768**2+768*2304: (768, 50304), (768,)+(768,)+(3072, 768), (768, 3072)+(768,), (768,)+(768, 768)+(768, 2304), (768,)+(768,)+(1024, 768)"
+# "bucket_cap = 768+768*3072+1 == 768+768**2+768*2304+1 to : (768, 50304), (768,)+(768,)+(3072, 768), (768, 3072)+(768,)+(768,), (768, 768)+(768, 2304)+(768,)+(768,), (1024, 768)"
+
+#1. Go through all params and group them by bucket_cap
+#2. Find the smallest (or second smallest if smallest is last bucket), increment by 4 and set as new bucket cap
+#3. Repeat until bucket cap = model size
+def enumerate_bucket_caps(ops: Dict, dims: ModelDimensions, all_params: List[Tuple[str, Tuple[int, ...]]]): #add return type
+    bucket_caps = [min(math.prod(p) for _, p in all_params if p != (0,)) * 4]
+    model_size = sum(math.prod(p) for _, p in all_params) * 4
+
+    while bucket_caps[-1] < model_size:
+        buckets = create_buckets(ops, dims, all_params, bucket_caps[-1]+4)
+        bucket_sizes = [sum(math.prod(p) for _, p in bucket) * 4 for bucket in buckets]
+        #case 1: more than 1 bucket, smallest bucket isn't last / case 2: more than 1 bucket, smallest bucket is last / case 3: only 1 bucket
+        next_cap = min(bucket_sizes[:-1] if len(bucket_sizes) > 1 and bucket_sizes.index(min(bucket_sizes)) == len(bucket_sizes)-1 
+                      else bucket_sizes)
+        bucket_caps.append(next_cap)
+
+    return bucket_caps
+
+def estimate_total_time_with_bucketed_gradient_reduction(ops: Dict, dims: ModelDimensions, precision: PrecisionType, accelerator: str, all_params: List[Tuple[str, Tuple[int, ...]]], bucket_cap: int, world_size: int, efficiency: float = 0.8) -> Dict[str, float]:
+    latency = estimate_combined_latency(ops, dims, precision, accelerator, efficiency)
+    full_ops_list = get_full_ops_list(ops, dims)
+    t_fwd = sum(latency[name]['forward'] for name in full_ops_list)
+
+    buckets = create_buckets(ops, dims, all_params, bucket_cap)
+    initial_bucket = buckets[0]
+    idx = 0
+    t_bwd_initial_bucket = 0
+    while idx < len(initial_bucket):
+        op_name = full_ops_list.pop(-1)
+        t_bwd_initial_bucket += latency[op_name]['backward']
+        if initial_bucket[idx][0] == op_name:
+            idx += len(ops[op_name]['params'])
+    t_bwd_remaining= sum(latency[op_name]['backward'] for op_name in full_ops_list)
+    t_comm_buckets = [estimate_all_reduce_time(ops, dims, accelerator, world_size, sum(math.prod(p) for _, p in bucket) * 4) for bucket in buckets]
+    t_comm_final_bucket = t_comm_buckets[-1]
+    t_comm_remaining = sum(t_comm_buckets[:-1])
+    t_backward = t_bwd_initial_bucket + max(t_bwd_remaining, t_comm_remaining) + t_comm_final_bucket
+    
+    # print(t_bwd_initial_bucket, t_bwd_remaining, t_comm_remaining, t_comm_final_bucket)
+    # print(t_fwd, t_backward)
+
+    return t_fwd + t_backward
 
 
 def main():
@@ -592,18 +657,26 @@ def main():
         )
         ops = get_gpt_ops(dims)
 
-        peak_mem = calculate_peak_memory(ops, dims, precision)
-        print(model_name, peak_mem/2**30)
-        # print(model_name, statically_allocated_mem/2**30, dynamically_allocated_mem/2**30)
-        # continue
-        # print(model_name, estimate_total_time(ops, dims, precision, accelerator, efficiency=0.8))
-        # print(estimate_gradient_all_reduce_time(dims, accelerator, 256))
-    
-        # world_size = batch_size / SEQ_LENGTH
-    
 
-        # latency, transport_time = estimate_gradient_all_reduce_time(dims, accelerator, world_size)
-        # print(f"{model_name}: {latency + transport_time:.6f}")
+        # all_params = get_all_params(ops, dims)
+        # for name, param in all_params:
+        #     print(name, param)
+        
+        full_ops = get_full_ops_list(ops, dims)
+        all_params = [(op, param) for op in full_ops for param in (ops[op]['params'] if ops[op]['params'] else [(0,)])]
+        # all_params = get_all_params(ops, dims)
+        # bucket_caps = enumerate_bucket_caps(ops, dims, all_params)
+        # total_times = {}
+        # for bucket_cap in bucket_caps:
+        #     total_times[bucket_cap] = estimate_total_time_with_bucketed_gradient_reduction(ops, dims, precision, accelerator, all_params, bucket_cap)
+
+        # print(total_times)
+
+        estimate_total_time_with_bucketed_gradient_reduction(ops, dims, precision, accelerator, all_params, (768*2+768**2+1)*4, 8)
+        import sys; sys.exit()
+
+
+
 
 
 if __name__ == '__main__':
