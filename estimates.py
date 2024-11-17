@@ -98,7 +98,7 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 }
             },
             'backward': {
-                'flops': 14 * b * s * h,
+                'flops': 13 * b * s * h,
                 'input_dims': [(b, s, h), (b, s, h), (b, s), (b, s), (h,), (h,)] #output.grad, input, mean, variance, gamma (param), beta (param)
             },
             'is_matmul': False,
@@ -250,7 +250,7 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 }
             },
             'backward': {
-                'flops': 14 * b * s * h,
+                'flops': 13 * b * s * h,
                 'input_dims': [(b, s, h), (b, s, h), (b, s), (b, s), (h,), (h,)] #output.grad, input, mean, variance, gamma (param), beta (param)
             },
             'is_matmul': False,
@@ -345,7 +345,7 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
                 }
             },
             'backward': {
-                'flops': 14 * b * s * h,
+                'flops': 13 * b * s * h,
                 'input_dims': [(b, s, h), (b, s, h), (b, s), (b, s), (h,), (h,)]#output.grad, input, mean, variance, gamma (param), beta (param)
             },
             'is_matmul': False,
