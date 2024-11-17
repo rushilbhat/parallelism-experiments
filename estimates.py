@@ -562,7 +562,7 @@ def get_full_ops_list(ops: Dict, dims: ModelDimensions) -> List[str]:
     layer_start_idx = next(i for i, op in enumerate(ops) if op == 'pre_attn_layer_norm')
     layer_end_idx = next(i for i, op in enumerate(ops) if op == 'post_mlp_residual')
 
-    return ops[:layer_start_idx] + ops[layer_start_idx:layer_end_idx+1] * 2 + ops[layer_end_idx+1:] #dims.L
+    return ops[:layer_start_idx] + ops[layer_start_idx:layer_end_idx+1] * dims.L + ops[layer_end_idx+1:] #dims.L
 
 def create_buckets(ops: Dict, dims: ModelDimensions, all_params: List[Tuple[str, Tuple[int, ...]]], bucket_cap: int):
     non_zero_params = [(name, param) for name, param in all_params if param != (0,)]
