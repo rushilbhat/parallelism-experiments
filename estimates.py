@@ -554,7 +554,7 @@ def estimate_all_reduce_time(accelerator: str, world_size: int, comm_volume: int
     #nIntraSteps = nSteps - nInterSteps
     #latency = (baseLat if world_size > 1 else 0) + nIntraSteps * intraLat + nInterSteps * interLat
     
-    latency  = (baseLat if world_size > 1 else 0) + nSteps (interLat if nNodes > 1 else intraLat) #following https://github.com/NVIDIA/nccl-tests/issues/123
+    latency  = (baseLat if world_size > 1 else 0) + nSteps * (interLat if nNodes > 1 else intraLat) #following https://github.com/NVIDIA/nccl-tests/issues/123
 
     effective_bandwidth = bandwidths[accelerator]["inter" if world_size > 1 else "intra"]
     transport_time = nSteps * comm_volume / (world_size * effective_bandwidth)
