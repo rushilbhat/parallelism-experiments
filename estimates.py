@@ -524,7 +524,7 @@ def estimate_total_time(ops: Dict, dims: ModelDimensions, precision: PrecisionTy
 
     return {'forward': total_time_fwd, 'backward': total_time_bwd}
 
-def estimate_all_reduce_time(ops: Dict, dims: ModelDimensions, accelerator: str, world_size: int, comm_volume: int):
+def estimate_all_reduce_time(accelerator: str, world_size: int, comm_volume: int):
     # base latency + per step latency * no. steps + amount of data / memory bandwidth * no. steps
 
     bandwidths = {
@@ -541,15 +541,20 @@ def estimate_all_reduce_time(ops: Dict, dims: ModelDimensions, accelerator: str,
     num_gpus_per_node = 8
     nNodes = math.ceil(world_size / num_gpus_per_node)
     nSteps = 2 * (world_size - 1)
-    nInterSteps = 2 * nNodes if world_size > 1 else 0
-    nIntraSteps = nSteps - nInterSteps
     
     #default values from comm_analysis.py
     baseLat = 6.6e-6
     intraLat = 1e-6
     interLat = 2.7e-6
 
-    latency = baseLat + nIntraSteps * intraLat + nInterSteps * interLat
+    #not sure why each step is split into interStep and intraStep when each step contains both inter- and intra-node communication
+    #in comm_analysis.py and https://github.com/NVIDIA/nccl/blob/master/src/graph/tuning.cc
+
+    #nInterSteps = 2 * nNodes if world_size > num_gpus_per_node else 0
+    #nIntraSteps = nSteps - nInterSteps
+    #latency = (baseLat if world_size > 1 else 0) + nIntraSteps * intraLat + nInterSteps * interLat
+    
+    latency  = (baseLat if world_size > 1 else 0) + nSteps (interLat if nNodes > 1 else intraLat) #following https://github.com/NVIDIA/nccl-tests/issues/123
 
     effective_bandwidth = bandwidths[accelerator]["inter" if world_size > 1 else "intra"]
     transport_time = nSteps * comm_volume / (world_size * effective_bandwidth)
@@ -564,7 +569,7 @@ def get_full_ops_list(ops: Dict, dims: ModelDimensions) -> List[str]:
 
     return ops[:layer_start_idx] + ops[layer_start_idx:layer_end_idx+1] * dims.L + ops[layer_end_idx+1:] #dims.L
 
-def create_buckets(ops: Dict, dims: ModelDimensions, all_params: List[Tuple[str, Tuple[int, ...]]], bucket_cap: int):
+def create_buckets(all_params: List[Tuple[str, Tuple[int, ...]]], bucket_cap: int):
     non_zero_params = [(name, param) for name, param in all_params if param != (0,)]
     buckets = [[]]
     for name, param in reversed(non_zero_params):
@@ -585,12 +590,12 @@ def create_buckets(ops: Dict, dims: ModelDimensions, all_params: List[Tuple[str,
 #1. Go through all params and group them by bucket_cap
 #2. Find the smallest (or second smallest if smallest is last bucket), increment by 4 and set as new bucket cap
 #3. Repeat until bucket cap = model size
-def enumerate_bucket_caps(ops: Dict, dims: ModelDimensions, all_params: List[Tuple[str, Tuple[int, ...]]]): #add return type
+def enumerate_bucket_caps(all_params: List[Tuple[str, Tuple[int, ...]]]): #add return type
     bucket_caps = [min(math.prod(p) for _, p in all_params if p != (0,)) * 4]
     model_size = sum(math.prod(p) for _, p in all_params) * 4
 
     while bucket_caps[-1] < model_size:
-        buckets = create_buckets(ops, dims, all_params, bucket_caps[-1]+4)
+        buckets = create_buckets(all_params, bucket_caps[-1]+4)
         bucket_sizes = [sum(math.prod(p) for _, p in bucket) * 4 for bucket in buckets]
         #case 1: more than 1 bucket, smallest bucket isn't last / case 2: more than 1 bucket, smallest bucket is last / case 3: only 1 bucket
         next_cap = min(bucket_sizes[:-1] if len(bucket_sizes) > 1 and bucket_sizes.index(min(bucket_sizes)) == len(bucket_sizes)-1 
@@ -604,7 +609,7 @@ def estimate_total_time_with_bucketed_gradient_reduction(ops: Dict, dims: ModelD
     full_ops_list = get_full_ops_list(ops, dims)
     t_fwd = sum(latency[name]['forward'] for name in full_ops_list)
 
-    buckets = create_buckets(ops, dims, all_params, bucket_cap)
+    buckets = create_buckets(all_params, bucket_cap)
     initial_bucket = buckets[0]
     idx = 0
     t_bwd_initial_bucket = 0
@@ -614,7 +619,7 @@ def estimate_total_time_with_bucketed_gradient_reduction(ops: Dict, dims: ModelD
         if initial_bucket[idx][0] == op_name:
             idx += len(ops[op_name]['params'])
     t_bwd_remaining= sum(latency[op_name]['backward'] for op_name in full_ops_list)
-    t_comm_buckets = [estimate_all_reduce_time(ops, dims, accelerator, world_size, sum(math.prod(p) for _, p in bucket) * 4) for bucket in buckets]
+    t_comm_buckets = [estimate_all_reduce_time(accelerator, world_size, sum(math.prod(p) for _, p in bucket) * 4) for bucket in buckets]
     t_comm_final_bucket = t_comm_buckets[-1]
     t_comm_remaining = sum(t_comm_buckets[:-1])
     t_backward = t_bwd_initial_bucket + max(t_bwd_remaining, t_comm_remaining) + t_comm_final_bucket
