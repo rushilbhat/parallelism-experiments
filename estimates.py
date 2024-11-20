@@ -524,7 +524,7 @@ def estimate_total_time(ops: Dict, dims: ModelDimensions, precision: PrecisionTy
 
     return {'forward': total_time_fwd, 'backward': total_time_bwd}
 
-def estimate_all_reduce_time(accelerator: str, world_size: int, comm_volume: int):
+def estimate_all_reduce_time(accelerator: str, world_size: int, comm_volume: int) -> Tuple[float, float]:
     # base latency + per step latency * no. steps + amount of data / memory bandwidth * no. steps
 
     bandwidths = {
@@ -555,11 +555,14 @@ def estimate_all_reduce_time(accelerator: str, world_size: int, comm_volume: int
     #latency = (baseLat if world_size > 1 else 0) + nIntraSteps * intraLat + nInterSteps * interLat
     
     latency  = (baseLat if world_size > 1 else 0) + nSteps * (interLat if nNodes > 1 else intraLat) #following https://github.com/NVIDIA/nccl-tests/issues/123
-
     effective_bandwidth = bandwidths[accelerator]["inter" if world_size > 1 else "intra"]
     transport_time = nSteps * comm_volume / (world_size * effective_bandwidth)
     
-    return latency + transport_time
+    return latency, transport_time
+    # return latency + transport_time
+
+def enumerate_world_size_microbatch_pairs(batch_size: int) -> List[Tuple[int, int]]:
+    return [(n, math.ceil(batch_size/n)) for n in range(1, batch_size+1) if n == 1 or (math.ceil(batch_size/n) < math.ceil(batch_size/(n-1)))]
 
 def get_full_ops_list(ops: Dict, dims: ModelDimensions) -> List[str]:
     ops = list(ops.keys())
@@ -569,7 +572,7 @@ def get_full_ops_list(ops: Dict, dims: ModelDimensions) -> List[str]:
 
     return ops[:layer_start_idx] + ops[layer_start_idx:layer_end_idx+1] * dims.L + ops[layer_end_idx+1:] #dims.L
 
-def create_buckets(all_params: List[Tuple[str, Tuple[int, ...]]], bucket_cap: int):
+def create_buckets(all_params: List[Tuple[str, Tuple[int, ...]]], bucket_cap: int) -> List[List[Tuple[str, Tuple[int, ...]]]]:
     non_zero_params = [(name, param) for name, param in all_params if param != (0,)]
     buckets = [[]]
     for name, param in reversed(non_zero_params):
@@ -590,7 +593,7 @@ def create_buckets(all_params: List[Tuple[str, Tuple[int, ...]]], bucket_cap: in
 #1. Go through all params and group them by bucket_cap
 #2. Find the smallest (or second smallest if smallest is last bucket), increment by 4 and set as new bucket cap
 #3. Repeat until bucket cap = model size
-def enumerate_bucket_caps(all_params: List[Tuple[str, Tuple[int, ...]]]): #add return type
+def enumerate_bucket_caps(all_params: List[Tuple[str, Tuple[int, ...]]]) -> List[int]:
     bucket_caps = [min(math.prod(p) for _, p in all_params if p != (0,)) * 4]
     model_size = sum(math.prod(p) for _, p in all_params) * 4
 
@@ -620,15 +623,33 @@ def estimate_total_time_with_bucketed_gradient_reduction(ops: Dict, dims: ModelD
             idx += len(ops[op_name]['params'])
     t_bwd_remaining= sum(latency[op_name]['backward'] for op_name in full_ops_list)
     t_comm_buckets = [estimate_all_reduce_time(accelerator, world_size, sum(math.prod(p) for _, p in bucket) * 4) for bucket in buckets]
-    t_comm_final_bucket = t_comm_buckets[-1]
-    t_comm_remaining = sum(t_comm_buckets[:-1])
-    t_backward = t_bwd_initial_bucket + max(t_bwd_remaining, t_comm_remaining) + t_comm_final_bucket
+    if len(t_comm_buckets) > 1:
+        t_comm_remaining = sum(lat + transport for lat, transport in t_comm_buckets[:-1])
+        t_comm_final_bucket = sum(t_comm_buckets[-1])
+    else:
+        t_comm_remaining = sum(t_comm_buckets[0])
+        t_comm_final_bucket = 0
     
-    # print(t_bwd_initial_bucket, t_bwd_remaining, t_comm_remaining, t_comm_final_bucket)
-    # print(t_fwd, t_backward)
+    t_total = t_fwd + t_bwd_initial_bucket + max(t_bwd_remaining, t_comm_remaining) + t_comm_final_bucket
+    latency = t_comm_buckets[0][0]
+    # return round(t_total, 12), round(t_fwd, 12), round(t_bwd_initial_bucket, 12), round(t_bwd_remaining, 12), round(t_comm_remaining, 12), round(t_comm_final_bucket, 12), len(t_comm_buckets[:-1]), latency
+    return round(t_total, 12)
 
-    return t_fwd + t_backward
+def find_optimal_bucket_cap(ops: Dict, dims: ModelDimensions, precision: PrecisionType, accelerator: str, all_params: List[Tuple[str, Tuple[int, ...]]], world_size: int, bucket_caps: List[int]) -> Tuple[float, int]:
+    # print(f"{'Bucket cap':<15} {'Time':<20} {'Fwd':<23} {'Bwd':<23} {'Bwd_init':<23} {'Bwd_rem':<23} {'Comm_rem':<23} {'Comm_final':<23} {'Bwd_rem < Comm_rem':<20}")
 
+    min_time = float('inf')
+    min_bucket_cap = None
+    for bucket_cap in bucket_caps:
+        time, t_fwd, t_bwd_initial_bucket, t_bwd_remaining, t_comm_remaining, t_comm_final_bucket, no_comm_steps, latency = estimate_total_time_with_bucketed_gradient_reduction(ops, dims, precision, accelerator, all_params, bucket_cap, world_size)
+        cumulative_comm_latency = no_comm_steps * latency
+        # print(f"{bucket_cap:<15} {time:<20} {t_fwd:<23} {t_backward:<23} {t_bwd_initial_bucket:<23} {t_bwd_remaining:<23} {t_comm_remaining:<23} {t_comm_final_bucket:<23} {t_bwd_remaining < t_comm_remaining} {' ':<20} {cumulative_comm_latency < t_bwd_remaining} {no_comm_steps:<20} {latency}") 
+        # print(f"{bucket_cap:<15} {time:<20} {t_fwd:<23} {t_backward:<23} {t_bwd_initial_bucket:<23} {t_bwd_remaining:<23} {t_comm_remaining:<23} {t_comm_final_bucket:<23} {cumulative_comm_latency:<23} {cumulative_comm_latency < t_bwd_remaining} {no_comm_steps}") 
+        if time < min_time:
+            min_time = time
+            min_bucket_cap = bucket_cap
+
+    return min_time, min_bucket_cap
 
 def main():
     models = [
@@ -643,43 +664,52 @@ def main():
         ("175B", 96, 96, 12288, 2**21 + 2**20 + 2**16),
     ]
 
-    MICRO_BATCH_SIZE = 12
-    SEQ_LENGTH = 1024
+    SEQ_LENGTH = 2048
     VOCAB_SIZE = 50304
 
     precision = PrecisionType.MIXED
     accelerator = "H100"
 
-    for model_name, num_layers, num_heads, hidden_dim, batch_size in models:
-        dims = ModelDimensions(
-            a=num_heads,
-            b=MICRO_BATCH_SIZE,
-            d=hidden_dim // num_heads,
-            h=hidden_dim,
-            L=num_layers,
-            s=SEQ_LENGTH,
-            V=VOCAB_SIZE
-        )
-        ops = get_gpt_ops(dims)
+    for model_name, num_layers, num_heads, hidden_dim, batch_size_in_toks in models:
+        batch_size = batch_size_in_toks // SEQ_LENGTH
+        ws_mb_pairs = enumerate_world_size_microbatch_pairs(batch_size)
+
+        # print(f"{'Model':<10} {'World size':<15} {'Microbatch size':<20} {'Bucket cap':<15} {'Time':<20} {'Fwd':<23} {'Bwd':<23} {'Bwd_init':<23} {'Bwd_rem':<23} {'Comm_rem':<23} {'Comm_final':<23}")
+        # print(f"{'Model':<10} {'Bucket cap':<15} {'Time'}")
+        # print(f"{'Model':<10} {'World size':<15} {'Microbatch size':<20} {'Time':<25} {'Fwd':<23} {'Bwd':<23} {'Comm':<23}")
+        # print(f"{'Model':<10} {'World size':<15} {'Latency':<25} {'Transport':<23}")
+        for world_size, microbatch_size in ws_mb_pairs:
+            dims = ModelDimensions(
+                a=num_heads,
+                b=microbatch_size,
+                d=hidden_dim // num_heads,
+                h=hidden_dim,
+                L=num_layers,
+                s=SEQ_LENGTH,
+                V=VOCAB_SIZE
+            )
+            if world_size == 1:
+                ops = get_gpt_ops(dims)
+                full_ops_list = get_full_ops_list(ops, dims)
+                all_params = [(op, param) for op in full_ops_list for param in (ops[op]['params'] if ops[op]['params'] else [(0,)])]
+                bucket_caps = enumerate_bucket_caps(all_params)
+                continue
+    
+            ops = get_gpt_ops(dims)
+
+            
+            # for bucket_cap in bucket_caps[-1:]:
+            #     time, t_fwd, t_backward, t_bwd_initial_bucket, t_bwd_remaining, t_comm_remaining, t_comm_final_bucket, no_comm_steps, latency = estimate_total_time_with_bucketed_gradient_reduction(ops, dims, precision, accelerator, all_params, bucket_cap, world_size)
+            #     print(f"{model_name:<10} {world_size:<15} {microbatch_size:<20} {bucket_cap:<15} {time:<20} {t_fwd:<23} {t_backward:<23} {t_bwd_initial_bucket:<23} {t_bwd_remaining:<23} {t_comm_remaining:<23} {t_comm_final_bucket:<23}")
+            # continue
 
 
-        # all_params = get_all_params(ops, dims)
-        # for name, param in all_params:
-        #     print(name, param)
-        
-        full_ops = get_full_ops_list(ops, dims)
-        all_params = [(op, param) for op in full_ops for param in (ops[op]['params'] if ops[op]['params'] else [(0,)])]
-        # all_params = get_all_params(ops, dims)
-        # bucket_caps = enumerate_bucket_caps(ops, dims, all_params)
-        # total_times = {}
-        # for bucket_cap in bucket_caps:
-        #     total_times[bucket_cap] = estimate_total_time_with_bucketed_gradient_reduction(ops, dims, precision, accelerator, all_params, bucket_cap)
-
-        # print(total_times)
-
-        estimate_total_time_with_bucketed_gradient_reduction(ops, dims, precision, accelerator, all_params, (768*2+768**2+1)*4, 8)
+            if world_size==2: print(f"Model: {model_name} | Model size: {sum(math.prod(p) for _, p in all_params) * 4}")
+            min_time, min_bucket_cap = find_optimal_bucket_cap(ops, dims, precision, accelerator, all_params, world_size, bucket_caps)
+            print(f"World size: {world_size} | Microbatch size: {microbatch_size} | Min time: {min_time} for bucket cap: {min_bucket_cap}")
         import sys; sys.exit()
-
+        # print("------------------------------------------------------------------------------------------------")
+        # import sys; sys.exit() 
 
 
 
