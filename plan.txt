@@ -1,0 +1,196 @@
+1. 
+    Consider the smallest model, 125M. Has seqeunce length 2048 toks and batch size of 0.5M toks = ~256 sequences per batch.  
+    Training dataset of 300B toks corresponds to 600,000 batches, meaning we have 600 steps per epoch. 
+
+    Training time basically scales linearly with batch size (gamma and beta are independet of b and are a tiny % of memory moved from HBM to on chip memory). 
+    If we hold latency of a single forward pass constant for now, does it make sense to parallelise training across multiple gpus? -> Only true if drop in 
+    computation time is not offset by increase in communication time.
+
+        - Relationship between batch size (B), micro batch size (b - i.e. biggest batch size that can be used on a single gpu) and no. devices (n): b = ceil(B / n)
+        - t_comp: t_comp_b=1 * b (scales linearly with micro batch size)
+        - t_comm: latency + transport_time = base_latency + [2(n-1) - 2ceil(n/8)] * intra_latency + 2ceil(n/8) * inter_latency + 2(n-1) * 4*P / (n * effective_bandwidth)
+        - t_total: t_comp + t_comm -> t_total is monotonically decreasing with n from 1 to 256 (domain must be restricted to n such that n and b have a 1-1 relationship 
+                   and n is the smallest integer that produces a given b, otherwise we just increase communication with no change in computation time)
+
+    Note: Ring all-reduce scales linearly with n, but tree all-reduce scales logarithmically - at higher n, ring all reduce time acts as an upper bound.
+
+    Now lets investigate the computation, communication trade off at different model sizes (which have different batch sizes) - is it the case that total time monotonically
+    decreases with n until n= batch size in toks / sequence length?
+        125M: 
+            Batch size: 2**19 / 2048 = 256
+            t_comp_b=1 (H100, mixed precision) = 0.006747316918916196
+        350M:
+            Batch size: 2**19 / 2048 = 256
+            t_comp_b=1 = 0.01766319361657396
+        1.3B: 
+            Batch size: 2**20 / 2048 = 512
+            t_comp_b=1 = 0.04246136167626241
+        2.7B: 
+            Batch size: 2**20 / 2048 = 512
+            t_comp_b=1 = 0.06854011353651962
+        6.7B:
+            Batch size: 2**21 / 2048 = 1024
+            t_comp_b=1 = 0.12099762121572522
+        13B:
+            Batch size: 2**21 / 2048 = 1024
+            t_comp_b=1 = 0.2193031389245691
+        175B:
+            Batch size: (2**21 + 2**20 + 2**16) / 2048 = 1568 (~3.2M / 2048)
+            t_comp_b=1 = 2.5111795636313357
+    350M should be parallelised across 256 gpus since for each n, drop in computation time will be greater than and increase in communication time will be same as 125M regime.
+    In fact, I think that they are all monotonically decreasing??
+
+    Note: Higher micro batch sizes lead to activation memory that far exceeds the memory of the largest GPU in the market. To achieve these, we would need to gradient accumulation.
+    Since data loader is not perfectly efficient and introduce some overhead, the computation times above act as lower bounds. In this way, drop in computation time from parallelising 
+    will be more than just linear.
+
+    *CAVEAT*
+    Communication time can be interleaved with backward pass using bucketed gradient reduction. As we work through the backward pass, we can fire an all reduce on the gradients
+    computed so far, and since we have separate streams for computation and communication, we can overlap the communication with the computation. For parallelisng across next n+k 
+    gpus, we no longer care about if t_comp_b1 + t_comm_n1 > t_comp_b2 + t_comm_n2 holds.
+
+    Bucketed gradient reduction:
+                    ┌─────┐┌─────┐┌─────┐
+                    │  3  ││  2  ││  1  │
+                    └─────┘└─────┘└─────┘
+       ┌───────┐┌───────┐┌───────┐
+       │   3   ││   2   ││   1   │
+       └───────┘└───────┘└───────┘
+
+    Time taken to complete 1 step: t_fwd + t_bwd_initial_bucket + max(t_bwd_second_bucket_to_final_bucket, t_comm_first_bucket_to_penultimate_bucket) + t_comm_final_bucket
+
+    1. Is it actually worth overlapping communication with computation?
+
+        - As long as t_bwd_second_bucket_to_final_bucket > t_comm_first_bucket_to_penultimate_bucket, we cannot be worse than sequential approach of t_fwd + t_bwd + t_comm_entire.
+          This is because the final bucket will always be smaller than the entire model (or equal to in the case where bucket_cap = model size)
+
+        - In the case where t_bwd_second_bucket_to_final_bucket < t_comm_first_bucket_to_penultimate_bucket, the extra cumulative latency from additional all-reduces must remain below a 
+          certain threshold. The case with smallest cumulative latency is trivial - when bucket_cap = model size (i.e. no additional all-reduces). The case with largest
+          cumulative latency is when bucket_cap = smallest param size (i.e. dims.h * 4) since that produces the most all-reduces. Non-layer ops 'wpe', 'final_layer_norm' and 'lm_head'
+          have 1, 2, 1 params respectively. Layer ops 'pre_attn_layer_norm', 'qkv_proj', 'output_proj', 'pre_mlp_layer_norm', 'mlp_up_proj', 'mlp_down_proj' have 2, 1, 1, 2, 1, 1 params
+          respectively (8 in total). Total no. all-reduces = (3 + 8*dims.L) + 1
+
+            - t_fwd + t_bwd + t_comm_entire > t_fwd + t_bwd_intial_bucket + t_comm_initial_bucket_to_penultimate_bucket + t_comm_final_bucket
+              t_bwd + t_comm_entire > t_bwd_initial_bucket + t_comm_initial_bucket_to_penultimate_bucket + t_comm_final_bucket
+              t_bwd_intial_bucket + t_bwd_second_bucket_to_final_bucket + t_comm_entire > t_bwd_initial_bucket + t_comm_initial_bucket_to_penultimate_bucket + t_comm_final_bucket
+              t_bwd_second_bucket_to_final_bucket + t_comm_entire > t_comm_initial_bucket_to_penultimate_bucket + t_comm_final_bucket
+              t_bwd_second_bucket_to_final_bucket + latency + t_transport_entire > (latency + t_transport_first_bucket) + ... + (latency + t_transport_penultimate_bucket) + latency + t_transport_final_bucket
+              t_bwd_second_bucket_to_final_bucket + latency + t_transport_first_bucket + ... + t_transport_final_bucket > (n-1) * latency + latency + t_transport_first_bucket + ... + t_transport_final_bucket
+              t_bwd_second_bucket_to_final_bucket > (n-1) * latency, where n-1 = 3 + 8*dims.L
+                - MENTAL NOTE: If cumulative latency were greater than t_bwd_second_bucket_to_final_bucket, then the amount of time after backward pass would be some latency + t_transport_first_bucket + ... +
+                  t_transport_final_bucket
+
+            - t_bwd_second_bucket_to_final_bucket is minimised and latency is maximised when (micro batch size, world size) = (1, batch size) -> However, with a seq_len of 2048, batch size of 1 at the 125M scale
+              is still computationally expensive enough to hide the extra cumulative latency
+
+        - Does this behaviour hold as we scale up the model size?
+            - As we increase world size at a give model size, we enter case 2. 
+        ------------------------------------------------------------------------------------------------
+        DECIDING OPTIMAL BUCKET CAP:
+        1. t_bwd_rem > t_comm_rem at smallest bucket cap
+            - No need to increase bucket cap since final bucket will be smallest it can be (i.e. single parameter) and so t_comm_final_bucket will be minimised
+            - Smallest bucket cap that allows for bwd to dominate comm is best because it allows for most overlapping without cumulative latency having any effect
+            - To tease this out, it is impossible for any larger bucker cap that allows causes t_bwd_rem < t_comm_rem to be faster in total. This is because the increase in t_bwd_init
+              will not be offset by decrease in t_bwd_rem since it no longer dominates t_comm_rem.
+            
+        2. t_bwd_rem < t_comm_rem at smallest bucket cap
+            - Keep increasing bucket cap until t_bwd_rem > t_comm_rem. 
+                - Is it the case that 
+        ------------------------------------------------------------------------------------------------
+
+            
+2. Problem 1 - peak memory, specifically static memory:
+    As we scale up the model size, the peak memory at 6.7B level exceeds the memory of the largest GPU in the market (sequence length 2048, batch size 1 produces
+    ~100GB static + 45GB dynamic; H100 has 80GB).
+
+    Current setup of data parallelsim replicates model, gradient and optimizer across all workers - not memory efficient. Note the gradient on each worker will be different in 
+    the interim during steps but eventually need to be synced at the end of each step. We can partition the training state (i.e model, grads and optimizer) across all workers and 
+    communicate the necessary information before performing computations 
+
+
+    [ ] ZERO-1 + ZeRO-2: optimiser + gradient sharding
+        - Communication volume is the same as non-sharded data parallel (i.e. all-reduce gradients), however this is done as a series of small all-reduces rather than a single large all-reduce
+          similar to bucketed gradient reduction. Once again, similarly to bucketed gradient reduction, the i-th unit's gradient communication/reduction is overlapped with the computation
+          during i+1-th unit's backward pass.
+
+        - Backward pass of a FSDP unit is split into following phases: all-gather the sharded gradients of the FSDP unit, compute the gradients of the FSDP unit, reduce-scatter the gradients 
+          of the FSDP unit. (i.e. reshard the unit's gradients) -> All-gather and reduce-scatter are implemented using the ring algorithm and so for larger world sizes the linear latency scaling
+          is difficult to hide. Furthermore, we can no longer vary the no. collective communication calls to reduce the cumulative latency (as we could do in bucketed gradient
+          reduction by varying the bucket size) since that cannot fall below the no. FSDP units (not strictly true, since we can keep multiple units unsharded before firing the reduce-scatter but
+          this comes at the cost of increased memory consumption).
+
+        - QUESTION: If we keep the strict assumption that only 1 FSDP unit can be materialised at a time, are you better off with fewer devices and sequential processing?
+            - No. FSDP units = no. all-gathers = no. reduce-scatters = no. blocks + 1  = dims.L + 1
+                - Considered 125M models with 12 layers, we have 13 FSDP units. Each unit is sharded across world size gpus.
+
+                    Naive approach with no overlap: Time taken = 12 * (all-gather_block + backward_pass + reduce-scatter_block) + all_gather_non_block + backward_pass + reduce_scatter_non_block
+                    With overlap: Time taken = all_gather_non_block + 
+                                            max(backward_pass_lm_head+layer_norm, all_gather_block12) + 
+                                            max(backward_pass_block12, all_gather_block11) + 
+                                            max(reduce-scatter_block12+all_gather_block10, backward_pass_block11) + 
+                                            max(reduce-scatter_block11+all_gather_block9, backward_pass_block10) +
+                                            ... + 
+                                            max(reduce-scatter_block3+all_gather_block1, backward_pass_block2) + 
+                                            max(backward_pass_block1 + max(reduce-scatter_block1, backward_pass_embeddings), 
+                                                reduce-scatter_block2 + reduce_scatter_block1) + 
+                                            reduce-scatter_non_block
+
+                    Derivation of final two terms:
+                        if backward_pass_block1 > reduce-scatter_block2:
+                            time += backward_pass_block1 + max(reduce-scatter_block1, backward_pass_embeddings) + reduce-scatter_non_block
+                        else:
+                            if backward_pass_block1 + backward_pass_embeddings > reduce-scatter_block2:
+                                time += max(backward_pass_block1 + backward_pass_embeddings, reduce-scatter_block2+reduce_scatter_block1) + reduce-scatter_non_block
+                            else:
+                                time += reduce-scatter_block2 + reduce-scatter_block1 + reduce-scatter_non_block
+
+                        -> options: 
+                        1. backward_pass_block1 + reduce-scatter_block1 + reduce-scatter_non_block
+                        2. backward_pass_block1 + backward_pass_embeddings + reduce-scatter_non_block
+                        3. backward_pass_block1 + backward_pass_embeddings + reduce-scatter_non_block
+                        4. reduce-scatter_block2 + reduce-scatter_block1 + reduce-scatter_non_block
+                        5. reduce-scatter_block2 + reduce-scatter_block1 + reduce-scatter_non_block
+
+                        collapses to:
+                        1. backward_pass_block1 + reduce-scatter_block1 + reduce-scatter_non_block
+                        2. backward_pass_block1 + backward_pass_embeddings + reduce-scatter_non_block
+                        5. reduce-scatter_block2 + reduce-scatter_block1 + reduce-scatter_non_block
+
+                ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                In FSDP, the model is split into a number of units. The first unit is comprised of text embedding layer, position emebedding layer, final layer norm, and langauge modeling head.
+                Each of the remaining units are comprised of a single transformer block. During the backward pass, the FSDP unit comprised of text embedding layer, position emebedding layer, and final layer norm is first
+                all gathered, the gradients for lm_head and layer norm are computed, but the unit is not sharded (i.e. reduce-scatter is not performed) since we still need to compute the gradients for embedding layers which
+                happen at the end of the backward pass. We then perform an all-gather on the next FSDP unit (i.e. first transformer block in the reverse sequence direction), compute the gradients, and perform a reduce-scatter.
+                This is repeated for all FSDP units comprised of transformer blocks until we need to compute the gradients for embeddings layers. Since this FSDP unit was not sharded
+                we don't perform an all-gather, but rather just compute gradients for embedding layers and finally perform a reduce-scatter on this FSDP unit.
+
+
+                In this naive paradigm there is no overlap of communication with computation so time = all_gather_non_block + backward_pass_lm_head+layer_norm + all_gather_block12 + backward_pass_block12 + reduce-scatter_block12 +
+                all_gather_block11 + backward_pass_block11 + reduce-scatter_block11 + ... + all_gather_block1 + backward_pass_block1 + reduce-scatter_block1 + backward_pass_position_embedding+text_embedding + reduce-scatter_non_block.
+
+                We can however, cleverly overlap communication with computation. This is done as follows: for the first fsdp unit (i.e. text embedding layer, position embedding layer, and final layer norm), we perform an all-gather and
+                then compute the gradients for lm_head and layer norm. While we are computing the gradients for lm_head and layer norm, we can perform an all-gather on the next FSDP unit (i.e. first transformer block in the reverse sequence direction).
+                Once we are done computing the gradients for lm_head and layer norm, we do not just yet perform reduce-scatter and instead start computing the gradients for the first transformer block in the reverse sequence direction. While we are 
+                computing the gradients for the first transformer block in the reverse sequence direction, we can perform an all-gather on the next FSDP unit (i.e. second transformer block in the reverse sequence direction). One we are done computing
+                the gradients for the first transformer block in the reverse sequence direction, we perform a reduce-scatter on the FSDP unit comprised of the first transformer block and simulataneously start computing gradients for the FSDP block comprised
+                of the second transformer block. If reduce-scatter of the FSDP unit comprised of the first transformer is done before gradients for the second transformer block are computed, we can start an all-gather for the FSDP unit comprised of the third transformer block
+                ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+    [ ] ZERO-3: parameter sharding
+        - How much latency does this introduce
+        - How much can be hidden by overlapping communication with computation
+
+
+
+
+
+
+3. Problem 2 - peak memory, specifically dynamic memory:
+4. So far we have held the latency of a training step constant. Can this be improved by parallelising across multiple gpus? (flops bound
+operations suitable for parallelisation)
+
+
+
+
