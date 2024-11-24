@@ -714,14 +714,16 @@ def main():
             
             #timing breakdown for each bucket cap
             #===================================================================================================================================
-            analyse_bucket_caps(ops, dims, precision, accelerator, all_params, world_size, bucket_caps)
-            continue
+            # analyse_bucket_caps(ops, dims, precision, accelerator, all_params, world_size, bucket_caps)
+            # continue
             #===================================================================================================================================
 
             #list optimal bucket cap for each model size, world size combo
             #===================================================================================================================================
+            if world_size ==2: print(f"{'World size':<15} {'Microbatch size':<20} {'Min time':<20} {'Bucket cap':<15}")
             min_time, min_bucket_cap = find_optimal_bucket_cap(ops, dims, precision, accelerator, all_params, world_size, bucket_caps)
-            print(f"World size: {world_size} | Microbatch size: {microbatch_size} | Min time: {min_time} for bucket cap: {min_bucket_cap}")
+            print(f"{world_size:<15} {microbatch_size:<20} {min_time:<20} {min_bucket_cap:<15}")
+            if world_size == batch_size: print(" ")
             #===================================================================================================================================
 
 
