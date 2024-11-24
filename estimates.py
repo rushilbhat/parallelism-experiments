@@ -404,7 +404,7 @@ def get_activation_memory(ops: Dict, dims: ModelDimensions, precision: Precision
     return activation_memory
 
 
-def calculate_peak_memory(ops: Dict, dims: ModelDimensions, precision: PrecisionType) -> float:
+def calculate_peak_memory(ops: Dict, dims: ModelDimensions, precision: PrecisionType, return_components: bool = False) -> float:
     param_counts = get_param_counts(ops, dims)    
     P = sum(count * (dims.L if ops[name]['is_per_layer'] else 1) for name, count in param_counts.items())
     
@@ -421,6 +421,12 @@ def calculate_peak_memory(ops: Dict, dims: ModelDimensions, precision: Precision
     
     peak_mem = statically_allocated_mem + dynamically_allocated_mem
     
+    if return_components:
+        return {
+            'peak': peak_mem/2**30,
+            'staically_allocated': statically_allocated_mem/2**30,
+            'dynamically_allocated': dynamically_allocated_mem/2**30
+        }
     return peak_mem
 
 def get_input_memory(ops: Dict, dims: ModelDimensions, precision: PrecisionType) -> Dict[str, Dict[str, int]]:
@@ -607,7 +613,7 @@ def enumerate_bucket_caps(all_params: List[Tuple[str, Tuple[int, ...]]]) -> List
 
     return bucket_caps
 
-def estimate_total_time_with_bucketed_gradient_reduction(ops: Dict, dims: ModelDimensions, precision: PrecisionType, accelerator: str, all_params: List[Tuple[str, Tuple[int, ...]]], bucket_cap: int, world_size: int, efficiency: float = 0.8) -> Dict[str, float]:
+def estimate_total_time_with_bucketed_gradient_reduction(ops: Dict, dims: ModelDimensions, precision: PrecisionType, accelerator: str, all_params: List[Tuple[str, Tuple[int, ...]]], bucket_cap: int, world_size: int, efficiency: float = 0.8, return_components: bool= False) -> Dict[str, float]:
     latency = estimate_combined_latency(ops, dims, precision, accelerator, efficiency)
     full_ops_list = get_full_ops_list(ops, dims)
     t_fwd = sum(latency[name]['forward'] for name in full_ops_list)
@@ -632,24 +638,36 @@ def estimate_total_time_with_bucketed_gradient_reduction(ops: Dict, dims: ModelD
     
     t_total = t_fwd + t_bwd_initial_bucket + max(t_bwd_remaining, t_comm_remaining) + t_comm_final_bucket
     latency = t_comm_buckets[0][0]
-    # return round(t_total, 12), round(t_fwd, 12), round(t_bwd_initial_bucket, 12), round(t_bwd_remaining, 12), round(t_comm_remaining, 12), round(t_comm_final_bucket, 12), len(t_comm_buckets[:-1]), latency
+
+    if return_components:
+        return {
+            'total': round(t_total, 12),
+            'forward': round(t_fwd, 12),
+            'backward_initial_bucket': round(t_bwd_initial_bucket, 12),
+            'backward_remaining': round(t_bwd_remaining, 12),
+            'comm_remaining': round(t_comm_remaining, 12),
+            'comm_final_bucket': round(t_comm_final_bucket, 12),
+            'num_comm_steps': len(t_comm_buckets) - 1,
+            'latency': t_comm_buckets[0][0]
+        }
+
     return round(t_total, 12)
 
 def find_optimal_bucket_cap(ops: Dict, dims: ModelDimensions, precision: PrecisionType, accelerator: str, all_params: List[Tuple[str, Tuple[int, ...]]], world_size: int, bucket_caps: List[int]) -> Tuple[float, int]:
-    # print(f"{'Bucket cap':<15} {'Time':<20} {'Fwd':<23} {'Bwd':<23} {'Bwd_init':<23} {'Bwd_rem':<23} {'Comm_rem':<23} {'Comm_final':<23} {'Bwd_rem < Comm_rem':<20}")
+    min_time, bucket_cap = min(
+        (estimate_total_time_with_bucketed_gradient_reduction(ops, dims, precision, accelerator, all_params, bucket_cap, world_size), bucket_cap) 
+        for bucket_cap in bucket_caps
+    )
 
-    min_time = float('inf')
-    min_bucket_cap = None
+    return min_time, bucket_cap
+
+def analyse_bucket_caps(ops: Dict, dims: ModelDimensions, precision: PrecisionType, accelerator: str, all_params: List[Tuple[str, Tuple[int, ...]]], world_size: int, bucket_caps: List[int]) -> Tuple[float, int]:
+    print(f"{'Bucket cap':<15} {'Time':<20} {'Fwd':<23} {'Bwd_init':<23} {'Bwd_rem':<23} {'Comm_rem':<23} {'Comm_final':<23} {'Bwd_rem < Comm_rem':<25} {'Cum_comm_lat < Bwd_rem':<30} {'No. comm steps':<20} {'Comm_latency':<20}")
+
     for bucket_cap in bucket_caps:
-        time, t_fwd, t_bwd_initial_bucket, t_bwd_remaining, t_comm_remaining, t_comm_final_bucket, no_comm_steps, latency = estimate_total_time_with_bucketed_gradient_reduction(ops, dims, precision, accelerator, all_params, bucket_cap, world_size)
-        cumulative_comm_latency = no_comm_steps * latency
-        # print(f"{bucket_cap:<15} {time:<20} {t_fwd:<23} {t_backward:<23} {t_bwd_initial_bucket:<23} {t_bwd_remaining:<23} {t_comm_remaining:<23} {t_comm_final_bucket:<23} {t_bwd_remaining < t_comm_remaining} {' ':<20} {cumulative_comm_latency < t_bwd_remaining} {no_comm_steps:<20} {latency}") 
-        # print(f"{bucket_cap:<15} {time:<20} {t_fwd:<23} {t_backward:<23} {t_bwd_initial_bucket:<23} {t_bwd_remaining:<23} {t_comm_remaining:<23} {t_comm_final_bucket:<23} {cumulative_comm_latency:<23} {cumulative_comm_latency < t_bwd_remaining} {no_comm_steps}") 
-        if time < min_time:
-            min_time = time
-            min_bucket_cap = bucket_cap
-
-    return min_time, min_bucket_cap
+        timing = estimate_total_time_with_bucketed_gradient_reduction(ops, dims, precision, accelerator, all_params, bucket_cap, world_size, return_components=True)
+        cumulative_comm_latency = timing['num_comm_steps'] * timing['latency']
+        print(f"{bucket_cap:<15} {timing['total']:<20} {timing['forward']:<23} {timing['backward_initial_bucket']:<23} {timing['backward_remaining']:<23} {timing['comm_remaining']:<23} {timing['comm_final_bucket']:<23} {str(timing['backward_remaining'] < timing['comm_remaining']):<25} {str(cumulative_comm_latency < timing['backward_remaining']):<30} {timing['num_comm_steps']:<20} {timing['latency']}") 
 
 def main():
     models = [
@@ -674,10 +692,6 @@ def main():
         batch_size = batch_size_in_toks // SEQ_LENGTH
         ws_mb_pairs = enumerate_world_size_microbatch_pairs(batch_size)
 
-        # print(f"{'Model':<10} {'World size':<15} {'Microbatch size':<20} {'Bucket cap':<15} {'Time':<20} {'Fwd':<23} {'Bwd':<23} {'Bwd_init':<23} {'Bwd_rem':<23} {'Comm_rem':<23} {'Comm_final':<23}")
-        # print(f"{'Model':<10} {'Bucket cap':<15} {'Time'}")
-        # print(f"{'Model':<10} {'World size':<15} {'Microbatch size':<20} {'Time':<25} {'Fwd':<23} {'Bwd':<23} {'Comm':<23}")
-        # print(f"{'Model':<10} {'World size':<15} {'Latency':<25} {'Transport':<23}")
         for world_size, microbatch_size in ws_mb_pairs:
             dims = ModelDimensions(
                 a=num_heads,
@@ -694,23 +708,21 @@ def main():
                 all_params = [(op, param) for op in full_ops_list for param in (ops[op]['params'] if ops[op]['params'] else [(0,)])]
                 bucket_caps = enumerate_bucket_caps(all_params)
                 continue
-    
-            ops = get_gpt_ops(dims)
-
-            
-            # for bucket_cap in bucket_caps[-1:]:
-            #     time, t_fwd, t_backward, t_bwd_initial_bucket, t_bwd_remaining, t_comm_remaining, t_comm_final_bucket, no_comm_steps, latency = estimate_total_time_with_bucketed_gradient_reduction(ops, dims, precision, accelerator, all_params, bucket_cap, world_size)
-            #     print(f"{model_name:<10} {world_size:<15} {microbatch_size:<20} {bucket_cap:<15} {time:<20} {t_fwd:<23} {t_backward:<23} {t_bwd_initial_bucket:<23} {t_bwd_remaining:<23} {t_comm_remaining:<23} {t_comm_final_bucket:<23}")
-            # continue
-
 
             if world_size==2: print(f"Model: {model_name} | Model size: {sum(math.prod(p) for _, p in all_params) * 4}")
+            ops = get_gpt_ops(dims)
+            
+            #timing breakdown for each bucket cap
+            #===================================================================================================================================
+            analyse_bucket_caps(ops, dims, precision, accelerator, all_params, world_size, bucket_caps)
+            continue
+            #===================================================================================================================================
+
+            #list optimal bucket cap for each model size, world size combo
+            #===================================================================================================================================
             min_time, min_bucket_cap = find_optimal_bucket_cap(ops, dims, precision, accelerator, all_params, world_size, bucket_caps)
             print(f"World size: {world_size} | Microbatch size: {microbatch_size} | Min time: {min_time} for bucket cap: {min_bucket_cap}")
-        import sys; sys.exit()
-        # print("------------------------------------------------------------------------------------------------")
-        # import sys; sys.exit() 
-
+            #===================================================================================================================================
 
 
 
