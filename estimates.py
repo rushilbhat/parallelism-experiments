@@ -568,7 +568,19 @@ def estimate_collective_comm_time(collective_op: str, accelerator: str, world_si
     # return latency + transport_time
 
 def enumerate_world_size_microbatch_pairs(batch_size: int) -> List[Tuple[int, int]]:
-    return [(n, math.ceil(batch_size/n)) for n in range(1, batch_size+1) if n == 1 or (math.ceil(batch_size/n) < math.ceil(batch_size/(n-1)))]
+    def get_microbatch_size(world_size: int) -> int:
+        return math.ceil(batch_size/world_size)
+    
+    def is_valid_world_size(n: int) -> bool:
+        if n == 1:
+            return True
+        prev_size = (n - 1) if n <= 8 else (n - 8)
+        return get_microbatch_size(n) < get_microbatch_size(prev_size)
+
+    return [(n, get_microbatch_size(n)) 
+            for n in range(1, batch_size+1)
+            if (n <= 8 or n % 8 == 0) and is_valid_world_size(n)
+    ]
 
 def get_full_ops_list(ops: Dict, dims: ModelDimensions) -> List[str]:
     ops = list(ops.keys())
