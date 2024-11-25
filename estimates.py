@@ -530,7 +530,7 @@ def estimate_total_time(ops: Dict, dims: ModelDimensions, precision: PrecisionTy
 
     return {'forward': total_time_fwd, 'backward': total_time_bwd}
 
-def estimate_all_reduce_time(accelerator: str, world_size: int, comm_volume: int) -> Tuple[float, float]:
+def estimate_collective_comm_time(collective_op: str, accelerator: str, world_size: int, comm_volume: int) -> Tuple[float, float]:
     # base latency + per step latency * no. steps + amount of data / memory bandwidth * no. steps
 
     bandwidths = {
@@ -546,7 +546,7 @@ def estimate_all_reduce_time(accelerator: str, world_size: int, comm_volume: int
 
     num_gpus_per_node = 8
     nNodes = math.ceil(world_size / num_gpus_per_node)
-    nSteps = 2 * (world_size - 1)
+    nSteps = (world_size - 1) * (2 if collective_op == "all-reduce" else 1)#all-reduce = reduce-scatter + all-gather
     
     #default values from comm_analysis.py
     baseLat = 6.6e-6
@@ -628,7 +628,7 @@ def estimate_total_time_with_bucketed_gradient_reduction(ops: Dict, dims: ModelD
         if initial_bucket[idx][0] == op_name:
             idx += len(ops[op_name]['params'])
     t_bwd_remaining= sum(latency[op_name]['backward'] for op_name in full_ops_list)
-    t_comm_buckets = [estimate_all_reduce_time(accelerator, world_size, sum(math.prod(p) for _, p in bucket) * 4) for bucket in buckets]
+    t_comm_buckets = [estimate_collective_comm_time("all-reduce", accelerator, world_size, sum(math.prod(p) for _, p in bucket) * 4) for bucket in buckets]
     if len(t_comm_buckets) > 1:
         t_comm_remaining = sum(lat + transport for lat, transport in t_comm_buckets[:-1])
         t_comm_final_bucket = sum(t_comm_buckets[-1])
@@ -668,6 +668,36 @@ def analyse_bucket_caps(ops: Dict, dims: ModelDimensions, precision: PrecisionTy
         timing = estimate_total_time_with_bucketed_gradient_reduction(ops, dims, precision, accelerator, all_params, bucket_cap, world_size, return_components=True)
         cumulative_comm_latency = timing['num_comm_steps'] * timing['latency']
         print(f"{bucket_cap:<15} {timing['total']:<20} {timing['forward']:<23} {timing['backward_initial_bucket']:<23} {timing['backward_remaining']:<23} {timing['comm_remaining']:<23} {timing['comm_final_bucket']:<23} {str(timing['backward_remaining'] < timing['comm_remaining']):<25} {str(cumulative_comm_latency < timing['backward_remaining']):<30} {timing['num_comm_steps']:<20} {timing['latency']}") 
+
+def estimate_total_time_with_fsdp(ops: Dict, dims: ModelDimensions, precision: PrecisionType, accelerator: str, world_size: int, return_components: bool=False):
+    root_unit_ops = ['wte', 'wpe', 'embeddings_sum', 'final_layer_norm', 'lm_head', 'log_softmax']
+    latency = estimate_combined_latency(ops, dims, precision, accelerator)
+
+    t_bwd_init = sum(latency[op]['backward'] for op in ['log_softmax', 'lm_head', 'final_layer_norm'])
+
+    block_size = sum(math.prod(p) for op, op_info in ops.items() 
+                    if op not in root_unit_ops 
+                    for p in op_info['params']) * 4
+    t_bwd_block = sum(latency[op]['backward'] for op in ops if op not in root_unit_ops)
+    t_rs_block = sum(estimate_collective_comm_time("reduce-scatter", accelerator, world_size, block_size))
+
+    t_bwd_embeddings = sum(latency[op]['backward'] for op in ['embeddings_sum', 'wpe', 'wte'])
+    root_size = sum(math.prod(p) for op in root_unit_ops for p in ops[op]['params']) * 4
+    t_rs_root = sum(estimate_collective_comm_time("reduce-scatter", accelerator, world_size, root_size))
+
+    time = t_bwd_init + (dims.L - 1) * max(t_rs_block, t_bwd_block) + max(t_rs_block, t_bwd_embeddings) + t_rs_root
+
+    if return_components:
+        return {
+            'total': round(time, 12),
+            'bwd_init': round(t_bwd_init, 12),
+            'rs_block': round(t_rs_block, 12),
+            'bwd_block': round(t_bwd_block, 12),
+            'bwd_embeddings': round(t_bwd_embeddings, 12),
+            'rs_root': round(t_rs_root, 12)
+        }
+
+    return time
 
 def main():
     models = [
@@ -720,12 +750,19 @@ def main():
 
             #list optimal bucket cap for each model size, world size combo
             #===================================================================================================================================
-            if world_size ==2: print(f"{'World size':<15} {'Microbatch size':<20} {'Min time':<20} {'Bucket cap':<15}")
-            min_time, min_bucket_cap = find_optimal_bucket_cap(ops, dims, precision, accelerator, all_params, world_size, bucket_caps)
-            print(f"{world_size:<15} {microbatch_size:<20} {min_time:<20} {min_bucket_cap:<15}")
-            if world_size == batch_size: print(" ")
+            # if world_size ==2: print(f"{'World size':<15} {'Microbatch size':<20} {'Min time':<20} {'Bucket cap':<15}")
+            # min_time, min_bucket_cap = find_optimal_bucket_cap(ops, dims, precision, accelerator, all_params, world_size, bucket_caps)
+            # print(f"{world_size:<15} {microbatch_size:<20} {min_time:<20} {min_bucket_cap:<15}")
+            # if world_size == batch_size: print(" ")
             #===================================================================================================================================
 
+            #timing breakdown for fsdp
+            #===================================================================================================================================
+            if world_size ==2: print(f"{'World size':<15} {'Microbatch size':<20} {'Time':<20} {'Bwd_init':<20} {'Rs_block':<20} {'Bwd_block':<20} {'Bwd_embeddings':<20} {'Rs_root':<20}")
+            timing = estimate_total_time_with_fsdp(ops, dims, precision, accelerator, world_size, return_components=True)
+            print(f"{world_size:<15} {microbatch_size:<20} {timing['total']:<20} {timing['bwd_init']:<20} {timing['rs_block']:<20} {timing['bwd_block']:<20} {timing['bwd_embeddings']:<20} {timing['rs_root']:<20}")
+            if world_size == batch_size: print(" ")
+            #===================================================================================================================================
 
 
 if __name__ == '__main__':
