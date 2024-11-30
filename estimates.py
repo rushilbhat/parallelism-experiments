@@ -406,9 +406,12 @@ def get_activation_memory(ops: Dict, precision: PrecisionType, grad_accum: bool 
     return activation_memory
 
 
-def calculate_peak_memory(ops: Dict, dims: ModelDimensions, precision: PrecisionType, grad_accum: bool = False, return_components: bool = False) -> float:
+def calculate_peak_memory(ops: Dict, dims: ModelDimensions, precision: PrecisionType, world_size: int, grad_accum: bool = False, FSDP: bool = False, return_components: bool = False) -> float:
     param_counts = get_param_counts(ops, dims)    
     P = sum(count * (dims.L if ops[name]['is_per_layer'] else 1) for name, count in param_counts.items())
+
+    if FSDP:
+        P /= world_size
     
     param_mem = 4 * P
     gradient_mem = 4 * P # assumes scheme under which grads persists (i.e grads initialised to zero or gradient accumulation)
