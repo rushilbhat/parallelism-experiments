@@ -394,11 +394,11 @@ def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Un
         }
     }
 
-def get_activation_memory(ops: Dict, dims: ModelDimensions, precision: PrecisionType) -> Dict[str, int]:
+def get_activation_memory(ops: Dict, precision: PrecisionType, grad_accum: bool = False) -> Dict[str, int]:
     activation_memory = {}
     for name, op_info in ops.items():
-        float32_count = sum(math.prod(dim) for dim in op_info['forward']['activation_dims']['float32'])
-        float16_count = sum(math.prod(dim) for dim in op_info['forward']['activation_dims']['float16'])
+        float32_count = sum(math.prod(dim[1:]) if grad_accum else math.prod(dim) for dim in op_info['forward']['activation_dims']['float32'])
+        float16_count = sum(math.prod(dim[1:]) if grad_accum and dim not in op_info['params'] else math.prod(dim) for dim in op_info['forward']['activation_dims']['float16'])
         if precision == PrecisionType.FULL or (precision == PrecisionType.MIXED and op_info['autocasts_to_float32']):
             activation_memory[name] = float32_count * 4
         else:
@@ -406,17 +406,17 @@ def get_activation_memory(ops: Dict, dims: ModelDimensions, precision: Precision
     return activation_memory
 
 
-def calculate_peak_memory(ops: Dict, dims: ModelDimensions, precision: PrecisionType, return_components: bool = False) -> float:
+def calculate_peak_memory(ops: Dict, dims: ModelDimensions, precision: PrecisionType, grad_accum: bool = False, return_components: bool = False) -> float:
     param_counts = get_param_counts(ops, dims)    
     P = sum(count * (dims.L if ops[name]['is_per_layer'] else 1) for name, count in param_counts.items())
     
     param_mem = 4 * P
-    gradient_mem = 4 * P # assumes scheme under which grads persists (i.e grads initialised to zero or gradient accumulation
+    gradient_mem = 4 * P # assumes scheme under which grads persists (i.e grads initialised to zero or gradient accumulation)
     optimizer_mem = 8 * P
     buffer_mem = 4 * (dims.s ** 2) * dims.L
     statically_allocated_mem = param_mem + gradient_mem + optimizer_mem + buffer_mem
     
-    activation_mem = get_activation_memory(ops, dims, precision)
+    activation_mem = get_activation_memory(ops, precision, grad_accum)
     dynamically_allocated_mem = 0
     for name, mem in activation_mem.items():
         dynamically_allocated_mem += mem * (dims.L if ops[name]['is_per_layer'] else 1)
@@ -779,7 +779,7 @@ def main():
 
             if world_size==2: print(f"Model: {model_name} | Model size: {sum(math.prod(p) for _, p in all_params) * 4}")
             ops = get_gpt_ops(dims)
-            
+
             #timing breakdown for each bucket cap
             #===================================================================================================================================
             # analyse_bucket_caps(ops, dims, precision, accelerator, all_params, world_size, bucket_caps)
