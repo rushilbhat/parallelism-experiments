@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Dict, Union, List, Tuple
 from enum import Enum
 import math
+from collections import Counter
 
 @dataclass
 class ModelDimensions:
@@ -18,9 +19,10 @@ class PrecisionType(Enum):
     MIXED = "mixed"
 
 def get_param_counts(ops: Dict, dims: ModelDimensions) -> Dict[str, int]:
-    counts = {}
-    for name, op_info in ops.items():
-        counts[name] = sum(math.prod(param) for param in op_info['params'])
+    counts = {
+        name: sum(math.prod(param) for param in op_info['params'])
+        for name, op_info in ops.items()
+    }
     return counts
 
 def get_gpt_ops(dims: ModelDimensions) -> Dict[str, Dict[str, Union[Dict[str, Union[int, List[Tuple[int, ...]], Dict[str, List[Tuple[int, ...]]]]], bool]]]:
@@ -535,12 +537,12 @@ def estimate_collective_comm_time(collective_op: str, accelerator: str, world_si
 
     bandwidths = {
         "H100": {
-            "inter": 450e9, #unidirectional
-            "intra": 8*48e9 #unidirectional
+            "intra": 450e9, #unidirectional
+            "inter": 8*48e9 #unidirectional
         },
         "A100": {
-            "inter": 300e9, #unidirectional
-            "intra": 8*24e9 #unidirectional
+            "intra": 300e9, #unidirectional
+            "inter": 8*24e9 #unidirectional
         }
     }
 
@@ -561,9 +563,9 @@ def estimate_collective_comm_time(collective_op: str, accelerator: str, world_si
     #latency = (baseLat if world_size > 1 else 0) + nIntraSteps * intraLat + nInterSteps * interLat
     
     latency  = (baseLat if world_size > 1 else 0) + nSteps * (interLat if nNodes > 1 else intraLat) #following https://github.com/NVIDIA/nccl-tests/issues/123
-    effective_bandwidth = bandwidths[accelerator]["inter" if world_size > 1 else "intra"]
+    effective_bandwidth = bandwidths[accelerator]["inter" if nNodes > 1 else "intra"]
     transport_time = nSteps * comm_volume / (world_size * effective_bandwidth)
-    
+
     return latency, transport_time
     # return latency + transport_time
 
@@ -681,35 +683,59 @@ def analyse_bucket_caps(ops: Dict, dims: ModelDimensions, precision: PrecisionTy
         cumulative_comm_latency = timing['num_comm_steps'] * timing['latency']
         print(f"{bucket_cap:<15} {timing['total']:<20} {timing['forward']:<23} {timing['backward_initial_bucket']:<23} {timing['backward_remaining']:<23} {timing['comm_remaining']:<23} {timing['comm_final_bucket']:<23} {str(timing['backward_remaining'] < timing['comm_remaining']):<25} {str(cumulative_comm_latency < timing['backward_remaining']):<30} {timing['num_comm_steps']:<20} {timing['latency']}") 
 
-def estimate_total_time_with_fsdp(ops: Dict, dims: ModelDimensions, precision: PrecisionType, accelerator: str, world_size: int, return_components: bool=False):
+def estimate_total_time_with_fsdp(ops: Dict, dims: ModelDimensions, precision: PrecisionType, accelerator: str, world_size: int, efficiency: float = 1.0, return_components: bool=False):
     root_unit_ops = ['wte', 'wpe', 'embeddings_sum', 'final_layer_norm', 'lm_head', 'log_softmax']
-    latency = estimate_combined_latency(ops, dims, precision, accelerator)
+    latency = estimate_combined_latency(ops, dims, precision, accelerator, efficiency)
+    counts = get_param_counts(ops, dims)
+    
+    root_size = sum(counts[op] for op in root_unit_ops) * 4
+    block_size = sum(counts[op] for op in ops if op not in root_unit_ops) * 4
 
-    t_bwd_init = sum(latency[op]['backward'] for op in ['log_softmax', 'lm_head', 'final_layer_norm'])
+    t_embeddings = sum((Counter(latency[op]) for op in root_unit_ops[:3]), Counter())
+    t_block = sum((Counter(latency[op]) for op in ops if op not in root_unit_ops), Counter())
+    t_ln_lmh_ls = sum((Counter(latency[op]) for op in root_unit_ops[3:]), Counter())
+    
+    #forward pass
+    #===================================================================================================================================
+    latency_ag_root, transport_ag_root = estimate_collective_comm_time('all-gather', accelerator, world_size, root_size)
+    latency_ag_block, transport_ag_block = estimate_collective_comm_time('all-gather', accelerator, world_size, block_size)
 
-    block_size = sum(math.prod(p) for op, op_info in ops.items() 
-                    if op not in root_unit_ops 
-                    for p in op_info['params']) * 4
-    t_bwd_block = sum(latency[op]['backward'] for op in ops if op not in root_unit_ops)
-    t_rs_block = sum(estimate_collective_comm_time("reduce-scatter", accelerator, world_size, block_size))
+    t_ag_root = latency_ag_root + transport_ag_root
+    t_ag_block = latency_ag_block + transport_ag_block
 
-    t_bwd_embeddings = sum(latency[op]['backward'] for op in ['embeddings_sum', 'wpe', 'wte'])
-    root_size = sum(math.prod(p) for op in root_unit_ops for p in ops[op]['params']) * 4
-    t_rs_root = sum(estimate_collective_comm_time("reduce-scatter", accelerator, world_size, root_size))
+    t_fwd = t_ag_root + max(t_embeddings['forward'], t_ag_block) + (dims.L - 1) * max(t_block['forward'], t_ag_block) + t_block['forward'] + t_ln_lmh_ls['forward']
 
-    time = t_bwd_init + (dims.L - 1) * max(t_rs_block, t_bwd_block) + max(t_rs_block, t_bwd_embeddings) + t_rs_root
+    #backward pass
+    #===================================================================================================================================
+    t_rs_root = t_ag_root
+    t_rs_block = t_ag_block
+
+    t_bwd = (max(t_ln_lmh_ls['backward'], t_ag_block) + 
+             max(t_block['backward'], t_ag_block) + 
+             max(t_block['backward'], t_rs_block+t_ag_block) * (dims.L-2) +
+             max(t_block['backward'] +  max(t_rs_block, t_embeddings['backward']), 2 * t_rs_block) +
+             t_rs_root)
+    
+    t_comp = t_embeddings['forward'] + dims.L * t_block['forward'] + t_ln_lmh_ls['forward'] + t_ln_lmh_ls['backward'] + dims.L * (t_block['backward']) + t_embeddings['backward']
+    
+    t_total = t_fwd + t_bwd
 
     if return_components:
         return {
-            'total': round(time, 12),
-            'bwd_init': round(t_bwd_init, 12),
-            'rs_block': round(t_rs_block, 12),
-            'bwd_block': round(t_bwd_block, 12),
-            'bwd_embeddings': round(t_bwd_embeddings, 12),
-            'rs_root': round(t_rs_root, 12)
+            'total': t_total,
+            'fwd': t_fwd,
+            'bwd': t_bwd,
+            'ag_root': t_ag_root,
+            'embeddings': t_embeddings,
+            'ag_block': t_ag_block,
+            'block': t_block,
+            'ln_lmh_ls': t_ln_lmh_ls,
+            'rs_root': t_rs_root,
+            'rs_block': t_rs_block,
+            'comp': t_comp
         }
 
-    return time
+    return t_total
 
 def main():
     models = [
@@ -719,8 +745,8 @@ def main():
         ("2.7B", 32, 32, 2560, 2**20),
         ("6.7B", 32, 32, 4096, 2**21),
         ("13B", 40, 40, 5120, 2**21), #GPT-3 paper says 5140
-        # ("30B", 48, 56, 7168),
-        # ("66B", 64, 72, 9216),
+        ("30B", 48, 56, 7168, 2**21),
+        ("66B", 64, 72, 9216, 2**21),
         ("175B", 96, 96, 12288, 2**21 + 2**20 + 2**16),
     ]
 
@@ -770,12 +796,12 @@ def main():
 
             #timing breakdown for fsdp
             #===================================================================================================================================
-            if world_size ==2: print(f"{'World size':<15} {'Microbatch size':<20} {'Time':<20} {'Bwd_init':<20} {'Rs_block':<20} {'Bwd_block':<20} {'Bwd_embeddings':<20} {'Rs_root':<20}")
+            if world_size ==2: print(f"{'World size':<15} {'Microbatch size':<20} {'Time':<15} {'Fwd':<15} {'Bwd':<15} {'AG root':<15} {'Fwd embeddings':<15} {'AG block':<15} {'Fwd block':<15} {'Fwd ln_lmh_ls':<15} {'Bwd ln_lmh_ls':<15} {'Bwd block':<15} {'Rs_block':<15} {'Bwd embeddings':<15} {'Rs_root':<15} {'Comp':<15}")
             timing = estimate_total_time_with_fsdp(ops, dims, precision, accelerator, world_size, return_components=True)
-            print(f"{world_size:<15} {microbatch_size:<20} {timing['total']:<20} {timing['bwd_init']:<20} {timing['rs_block']:<20} {timing['bwd_block']:<20} {timing['bwd_embeddings']:<20} {timing['rs_root']:<20}")
+            print(f"{world_size:<15} {microbatch_size:<20} {timing['total']:<15.10f} {timing['fwd']:<15.10f} {timing['bwd']:<15.10f} {timing['ag_root']:<15.12f} {timing['embeddings']['forward']:<15.12f} {timing['ag_block']:<15.12f} {timing['block']['forward']:<15.12f} {timing['ln_lmh_ls']['forward']:<15.12f} {timing['ln_lmh_ls']['backward']:<15.12f} {timing['block']['backward']:<15.12f} {timing['rs_block']:<15.12f} {timing['embeddings']['backward']:<15.12f} {timing['rs_root']:<15.12f} {100*((timing['total'] - timing['comp']) / timing['comp']):<15.12f}")
             if world_size == batch_size: print(" ")
             #===================================================================================================================================
-
-
+            # import sys; sys.exit()
+        # import sys; sys.exit()
 if __name__ == '__main__':
     main()
