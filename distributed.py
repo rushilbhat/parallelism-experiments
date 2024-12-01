@@ -87,11 +87,9 @@ class Reducer:
 
 
 class CustomDDP(nn.Module):
-    def __init__(self, module, process_group, bucket_cap_mb=25): 
+    def __init__(self, module, world_size, bucket_cap_mb=25): 
         super().__init__()
         self.module = module
-        self.process_group = process_group
-        world_size = dist.get_world_size(self.process_group)
         self.reducer = Reducer(self.module.named_parameters(), bucket_cap_mb, world_size)
 
     def set_require_backward_grad_sync(self, require_sync):

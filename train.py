@@ -33,7 +33,7 @@ if ddp:
     # use of DDP atm demands CUDA, we set the device appropriately according to rank
     assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
     args = parse_args()
-    process_group = init_process_group(backend='nccl')
+    init_process_group(backend='nccl')
     ddp_rank = int(os.environ['RANK'])
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
     ddp_world_size = int(os.environ['WORLD_SIZE'])
@@ -85,9 +85,9 @@ if ddp:
     if args.ddp_type == 'pytorch':
         model = DDP(model, device_ids=[ddp_local_rank])
     else:
-        model = CustomDDP(model, process_group)
+        model = CustomDDP(model, ddp_world_size)
 
-    print(f"using DDP implementation: {args.ddp_type}")
+    if master_process: print(f"using DDP implementation: {args.ddp_type}")
 
 raw_model = model.module if ddp else model # always contains the "raw" unwrapped model
 
