@@ -21,7 +21,7 @@ from contextlib import nullcontext
 
 from model import GPT, GPTConfig, Block
 from data_loader import DataLoaderLite
-from distributed import CustomDDP
+from distributed import CustomDDP, CustomFSDP
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Training script with distributed options')
@@ -85,25 +85,30 @@ def get_param_dims(model):
         param_dims[name] = param.dim()
     return param_dims
 
-# create model
-model = GPT(GPTConfig(vocab_size=50304))
-# model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
-model.to(device)
+device_context = torch.device('meta') if (is_distributed and args.data_parallel_type == "fsdp" and args.implementation == "custom") else nullcontext()
+with device_context:
+    model = GPT(GPTConfig(vocab_size=50304))
 param_dims = get_param_dims(model)
-use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
-if use_compile:
-    model = torch.compile(model)
+
 if is_distributed:
-    if args.data_parallel_type == "ddp":
-        model = DDP(model, device_ids=[distributed_local_rank]) if args.implementation == "pytorch" else CustomDDP(model, distributed_world_size)
-    elif args.data_parallel_type == "fsdp":
-        gpt2_auto_wrap_policy = functools.partial(
-            transformer_auto_wrap_policy,
-            transformer_layer_cls={
-                Block,
-            },
-        )
-        model = FSDP(model, auto_wrap_policy=gpt2_auto_wrap_policy, use_orig_params=True) # param_init_fn=init_weights
+    if args.data_parallel_type == "fsdp":
+        if args.implementation == "custom":
+            model = CustomFSDP(model, param_init_fn=model._init_weights, world_size=distributed_world_size, rank=distributed_rank)
+        else: # pytorch
+            # state_dict = torch.load('model_weights.pth')
+            # model.load_state_dict(state_dict)
+            gpt2_auto_wrap_policy = functools.partial(
+                transformer_auto_wrap_policy,
+                transformer_layer_cls={
+                    Block,
+                },
+            )
+            model = FSDP(model.to(device), auto_wrap_policy=gpt2_auto_wrap_policy, use_orig_params=True) # param_init_fn=init_weights
+    elif args.data_parallel_type == "ddp":
+        if args.implementation == "custom":
+            model = CustomDDP(model.to(device), distributed_world_size)
+        else: # pytorch
+            model = DDP(model.to(device), device_ids=[distributed_local_rank])
 
     if master_process: print(f"using {args.data_parallel_type} implementation: {args.implementation}")
 
@@ -141,19 +146,19 @@ for step in range(max_steps):
     last_step = (step == max_steps - 1)
 
     model.train()
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=not(is_distributed and args.data_parallel_type == "fsdp" and args.implementation == "custom"))
     loss_accum = 0.0
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
+        grad_sync_context = nullcontext()
         if is_distributed:
-            context = nullcontext()
             if args.data_parallel_type == 'ddp' and args.implementation == 'pytorch':
-                context = model.no_sync() if micro_step < grad_accum_steps - 1 else nullcontext()
+                grad_sync_context = model.no_sync() if micro_step < grad_accum_steps - 1 else grad_sync_context
             elif args.data_parallel_type == 'ddp' and args.implementation == 'custom':
                 model.set_require_backward_grad_sync(micro_step == grad_accum_steps - 1)
         
-        with context:
+        with grad_sync_context:
             with torch.autocast(device_type=device_type, dtype=torch.float16):
                 logits, loss = model(x, y)
             # we have to scale the loss to account for gradient accumulation,
