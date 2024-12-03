@@ -306,7 +306,7 @@ class CustomFSDP(torch.nn.Module):
                 param.register_post_accumulate_grad_hook(lambda p, u=unit, n=name: u.post_backward(n))
 
     @torch.no_grad()
-    def clip_grad_norm(self, max_norm):
+    def clip_grad_norm_(self, max_norm):
         local_grad_norm = torch.linalg.vector_norm(
             torch.stack(
                 [
