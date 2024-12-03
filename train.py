@@ -23,12 +23,15 @@ from model import GPT, GPTConfig, Block
 from data_loader import DataLoaderLite
 from distributed import CustomDDP, CustomFSDP
 
-def parse_args():
+def parse_args(is_distributed):
     parser = argparse.ArgumentParser(description='Training script with distributed options')
-    parser.add_argument('--data_parallel_type', type=str, choices=['ddp', 'fsdp'], 
-                      default='ddp', help='Choose dataparallelization strategy: ddp or fsdp')
-    parser.add_argument('--implementation', type=str, choices=['pytorch', 'custom'], 
+    if is_distributed:
+        parser.add_argument('--data_parallel_type', type=str, choices=['ddp', 'fsdp'], 
+                        default='ddp', help='Choose dataparallelization strategy: ddp or fsdp')
+        parser.add_argument('--implementation', type=str, choices=['pytorch', 'custom'], 
                       default='pytorch', help='Choose distributed implementation: pytorch or custom')
+    
+    parser.add_argument('--gradient_clipping', type=bool, default=False, help='Whether to use gradient clipping')
     return parser.parse_args()
 
 
@@ -37,7 +40,6 @@ is_distributed = int(os.environ.get('RANK', -1)) != -1 # is this a distributed r
 if is_distributed:
     # use of DDP atm demands CUDA, we set the device appropriately according to rank
     assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
-    args = parse_args()
     init_process_group(backend='nccl')
     distributed_rank = int(os.environ['RANK'])
     distributed_local_rank = int(os.environ['LOCAL_RANK'])
@@ -61,6 +63,8 @@ else:
 
 # added after video, pytorch can be serious about it's device vs. device_type distinction
 device_type = "cuda" if device.startswith("cuda") else "cpu"
+
+args = parse_args(is_distributed)
 
 torch.manual_seed(1337)
 if torch.cuda.is_available():
@@ -111,6 +115,8 @@ if is_distributed:
             model = DDP(model.to(device), device_ids=[distributed_local_rank])
 
     if master_process: print(f"using {args.data_parallel_type} implementation: {args.implementation}")
+else:
+    model = model.to(device)
 
 raw_model = model.module if is_distributed else model # always contains the "raw" unwrapped model
 
@@ -170,7 +176,10 @@ for step in range(max_steps):
             loss.backward()
     if is_distributed:
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
-    #norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+    if args.gradient_clipping:
+        norm = model.clip_grad_norm_(max_norm=1.0) if is_distributed and args.data_parallel_type == "fsdp" else torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    
     # determine and set the learning rate for this iteration
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
@@ -183,8 +192,7 @@ for step in range(max_steps):
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * distributed_world_size
     tokens_per_sec = tokens_processed / dt
     if master_process:
-        #print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
-        print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {f'{norm:.4f}' if args.gradient_clipping else None} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
 
 if is_distributed:
     destroy_process_group()
