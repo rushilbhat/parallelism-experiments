@@ -89,7 +89,7 @@ def get_param_dims(model):
         param_dims[name] = param.dim()
     return param_dims
 
-device_context = torch.device('meta') if (is_distributed and args.data_parallel_type == "fsdp" and args.implementation == "custom") else nullcontext()
+device_context = torch.device('meta') if (is_distributed and args.data_parallel_type == "fsdp") else nullcontext()
 with device_context:
     model = GPT(GPTConfig(vocab_size=50304))
 param_dims = get_param_dims(model)
@@ -99,15 +99,23 @@ if is_distributed:
         if args.implementation == "custom":
             model = CustomFSDP(model, param_init_fn=model._init_weights, world_size=distributed_world_size, rank=distributed_rank)
         else: # pytorch
-            # state_dict = torch.load('model_weights.pth')
-            # model.load_state_dict(state_dict)
+            def init_weights(module):
+                if module != model.lm_head:
+                    module.to_empty(device=torch.device(f'cuda:{distributed_local_rank}'), recurse=False)
+                    model._init_weights(module)
+
+                if module == model.transformer.wte:
+                    model.lm_head.weight = model.transformer.wte.weight
+
             gpt2_auto_wrap_policy = functools.partial(
                 transformer_auto_wrap_policy,
                 transformer_layer_cls={
                     Block,
                 },
             )
-            model = FSDP(model.to(device), auto_wrap_policy=gpt2_auto_wrap_policy, use_orig_params=True) # param_init_fn=init_weights
+            # state_dict = torch.load('model_weights.pth')
+            # model.load_state_dict(state_dict)
+            model = FSDP(model, auto_wrap_policy=gpt2_auto_wrap_policy, use_orig_params=True, param_init_fn=init_weights)
     elif args.data_parallel_type == "ddp":
         if args.implementation == "custom":
             model = CustomDDP(model.to(device), distributed_world_size)

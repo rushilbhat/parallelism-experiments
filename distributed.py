@@ -162,9 +162,6 @@ class FSDPUnit:
         self.local_shard.grad = torch.zeros_like(self.local_shard)
         # if self.is_master: self._measure_gpu_memory(f"After creating local_shard and grad ")
         self.update_module_params(include_grads=False)
-        for m in self.module_list.modules():
-            if len(list(m.children())) == 0 and hasattr(m, 'reset_parameters'): 
-                m.reset_parameters() #doesn't break weight sharing scheme since it's an in place operation
         self.module_list.apply(param_init_fn)
 
         start_idx = self.rank * shard_size
