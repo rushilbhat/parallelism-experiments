@@ -31,7 +31,7 @@ def parse_args(is_distributed):
         parser.add_argument('--implementation', type=str, choices=['pytorch', 'custom'], 
                       default='pytorch', help='Choose distributed implementation: pytorch or custom')
     
-    parser.add_argument('--gradient_clipping', type=bool, default=False, help='Whether to use gradient clipping')
+    parser.add_argument('--gradient_clipping', action=argparse.BooleanOptionalAction)
     return parser.parse_args()
 
 
