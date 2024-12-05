@@ -2,10 +2,12 @@
 
 This repository contains custom implementations of PyTorch's Distributed Data Parallel (DDP) and Fully Sharded Data Parallel (FSDP) training strategies, specifically tailored for [nanoGPT](https://github.com/karpathy/nanoGPT). The implementations focus on providing efficient distributed training capabilities while maintaining simplicity and readability.
 
+> For theoretical performance modeling, check out the `blog` branch which contains `estimates.py`: theoretical performance model for distributed language model training that analyzes the interplay between compute (FLOPs), memory bandwidth (HBM), and network throughput across different parallelization strategies and accelerator configurations.
+
 ## CustomDDP Features
 
 - **Automatic Parameter Bucketing**: Adjustable bucket sizes to tune communication overhead
-- **Asynchronous Communication**: Overlaps computation and communication during backward pass
+- **Asynchronous Communication**: Overlaps computation and communication during backward pass 
 - **Configurable Gradient Synchronization**: Interface for manual control over synchronization timing
 
 ## CustomFSDP Features
