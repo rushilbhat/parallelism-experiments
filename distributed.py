@@ -40,6 +40,7 @@ class Reducer:
         self.buckets.append(current_bucket)
 
     def _register_hooks(self):
+        # Add hooks to trigger gradient reduction when all grads in bucket are ready
         for bucket in self.buckets:
             for param in bucket.parameters.values():
                 def hook(p, b=bucket):
@@ -59,6 +60,7 @@ class Reducer:
         self.reduced_buckets_count += 1
 
     def finalize_backward(self):
+        #Wait for all async reductions and update gradients
         for future, bucket in self.futures:
             future.wait()
             flat_grads = future.result()
@@ -105,12 +107,12 @@ class FSDPUnit:
         self.world_size = world_size
         self.rank = rank
         self.is_master = (rank == 0)
-        self.local_shard = None
-        self.flat_param = None
+        self.local_shard = None # Local shard of flat_param
+        self.flat_param = None # Full flattened parameters when FSDP unit is gathered
         self.param_numels = []
         self.param_shapes = []
         self.param_names = []
-        self.shared_params = {}
+        self.shared_params = {} # Tracks parameter sharing
         self.unit_name = unit_name
         self.before_buffer = 0
         self.after_buffer = 0
@@ -135,6 +137,7 @@ class FSDPUnit:
         if after_flag: self.after_buffer = memory_allocated
         
     def _record_param_metadata(self):
+        # Track parameter metadata and identify shared parameters
         all_params = dict(self.module_list.named_parameters(remove_duplicate=False))
         unique_params = dict(self.module_list.named_parameters())
         param_id_to_name = {id(param): name for name, param in unique_params.items()}
@@ -188,7 +191,7 @@ class FSDPUnit:
                 param_tensor = self.flat_param[offset:offset+numel].view(shape)
                 grad_tensor = self.flat_param.grad[offset:offset+numel].view(shape) if include_grads else None
             name_parts = name.split('.')
-            module = self.module_list #clean up naming
+            module = self.module_list
             for part in name_parts[:-1]:
                 module = getattr(module, part)
             if getattr(module, name_parts[-1]).device.type == 'meta':
@@ -272,19 +275,21 @@ class CustomFSDP(torch.nn.Module):
         self._register_hooks()
 
     def _create_fsdp_units_for_gpt(self, gpt_model, param_init_fn):
+        # Create FSDP units for transformer blocks and root modules
         fsdp_units = []
         for block in gpt_model.transformer.h:
             fsdp_units.append(FSDPUnit(nn.ModuleList([block]), param_init_fn, self.world_size, self.rank, "block"))
-        remaining_params = nn.ModuleList([
+        root_modules = nn.ModuleList([
             gpt_model.transformer.wte, 
             gpt_model.transformer.wpe, 
             gpt_model.transformer.ln_f, 
             gpt_model.lm_head
         ])
-        fsdp_units.append(FSDPUnit(remaining_params, param_init_fn, self.world_size, self.rank, "remaining"))
+        fsdp_units.append(FSDPUnit(root_modules, param_init_fn, self.world_size, self.rank, "root"))
         return fsdp_units
         
     def _register_hooks(self):
+        # Register hooks for automatic gather/shard during forward/backward passes
         for i, unit in enumerate(self.fsdp_units):
             for j, module in enumerate(unit.module_list):
                 if j == 0 and len(unit.module_list) == 1:
@@ -293,7 +298,6 @@ class CustomFSDP(torch.nn.Module):
                     module.register_forward_pre_hook(lambda m, i, u=unit: u.gather()) 
                 # Only add post-forward hook to the last module in each unit except for the last fsdp unit 
                 # (wrt declared order, not logical order) 
-                # CHANGE
                 if j == len(unit.module_list)-1: 
                     if len(unit.module_list) == 1: 
                         module.register_forward_hook(lambda m, i, o, u=unit: u.shard()) 
