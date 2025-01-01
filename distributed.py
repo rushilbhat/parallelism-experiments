@@ -180,45 +180,63 @@ class CustomFSDP(torch.nn.Module):
         self.shard()
 
 
-    def update_module_params(self, include_grads, flag=False):
-        is_sharded = self.flat_param.data_ptr() == self.local_shard.data_ptr()
-        local_shard_size = self.local_shard.numel()
-        offset = 0 - local_shard_size * self.rank if is_sharded else 0
-        for name, numel, shape in zip(self.param_names, self.param_numels, self.param_shapes):
-            if is_sharded:
-                # offset >= local_shard_size check is for shard on rank0 and offset + numel < 0 check is for shard on other ranks
-                if offset + numel < 0 or offset >= local_shard_size:  
-                    param_tensor = torch.empty(0, device='cuda')
-                    grad_tensor = None
-                else:
-                    start = max(offset, 0)
-                    end = min(offset+numel, local_shard_size)
-                    param_tensor = self.local_shard[start:end]
-                    grad_tensor = self.local_shard.grad[start:end] if include_grads else None
-            else:
-                param_tensor = self.flat_param[offset:offset+numel].view(shape)
-                grad_tensor = self.flat_param.grad[offset:offset+numel].view(shape) if include_grads else None
-            name_parts = name.split('.')
-            module = self.module
-            for part in name_parts[:-1]:
-                module = getattr(module, part)
-            if getattr(module, name_parts[-1]).device.type == 'meta':
-                setattr(module, name_parts[-1], nn.Parameter(param_tensor))
-            else:
-                getattr(module, name_parts[-1]).data = param_tensor
+    def _retrieve_param_and_grad_tensors(self, offset, numel, shape, is_sharded, local_shard_size, include_grads):
+        if is_sharded:
+            # Handle cases where parameter lies outside this shard
+            if offset + numel < 0 or offset >= local_shard_size:
+                return torch.empty(0, device='cuda'), None
+            
+            # Get slice of parameter from local shard
+            start = max(offset, 0)
+            end = min(offset + numel, local_shard_size)
+            param_tensor = self.local_shard[start:end]
+            grad_tensor = self.local_shard.grad[start:end] if include_grads else None
+        else:
+            # Get slice from full flattened parameter
+            param_tensor = self.flat_param[offset:offset+numel].view(shape)
+            grad_tensor = self.flat_param.grad[offset:offset+numel].view(shape) if include_grads else None
+        
+        return param_tensor, grad_tensor
 
-            if include_grads:
-                getattr(module, name_parts[-1]).grad = grad_tensor
-            offset += numel
+    def _assign_param_to_module(self, name, param_tensor, grad_tensor, include_grads):
+        # Navigate module hierarchy to find parameter
+        name_parts = name.split('.')
+        module = self.module
+        for part in name_parts[:-1]:
+            module = getattr(module, part)
+                    
+        # Update parameter data
+        if getattr(module, name_parts[-1]).device.type == 'meta':
+            setattr(module, name_parts[-1], nn.Parameter(param_tensor))
+        else:
+            getattr(module, name_parts[-1]).data = param_tensor
 
-        unique_params = dict(self.module.named_parameters())
+        # Update gradient if needed
+        if include_grads:
+            getattr(module, name_parts[-1]).grad = grad_tensor
+
+    def _handle_shared_params(self):
         if len(self.shared_params) > 0:
+            unique_params = dict(self.module.named_parameters())
             for duplicate, original in self.shared_params.items():
                 name_parts = duplicate.split('.')
                 module = self.module
                 for part in name_parts[:-1]:
                     module = getattr(module, part)
-                    setattr(module, name_parts[-1], unique_params[original])
+                setattr(module, name_parts[-1], unique_params[original])
+    
+    def update_module_params(self, include_grads, flag=False):
+        is_sharded = self.flat_param.data_ptr() == self.local_shard.data_ptr()
+        local_shard_size = self.local_shard.numel()
+        offset = 0 - local_shard_size * self.rank if is_sharded else 0
+
+        # Update all parameters
+        for name, numel, shape in zip(self.param_names, self.param_numels, self.param_shapes):
+            param_tensor, grad_tensor = self._retrieve_param_and_grad_tensors(offset, numel, shape, is_sharded, local_shard_size, include_grads)
+            self._assign_param_to_module(name, param_tensor, grad_tensor, include_grads)
+            offset += numel
+
+        self._handle_shared_params()
 
     def gather(self, include_grads=False, flag=True):
         params_sharded = self.flat_param.data_ptr() == self.local_shard.data_ptr()
