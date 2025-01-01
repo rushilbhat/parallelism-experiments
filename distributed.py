@@ -158,17 +158,17 @@ class CustomFSDP(torch.nn.Module):
         self.flat_param = torch.zeros(padded_size, device='cuda')
         self.local_shard = torch.zeros(shard_size, device='cuda')
         self.local_shard.grad = torch.zeros_like(self.local_shard)
-        self._update_module_params(include_grads=False)
+        self._update_module_params()
 
-        def apply_param_init_fn(module, param_init_fn):
+        def _apply_param_init_fn(module, param_init_fn):
             if not isinstance(module, CustomFSDP):
                 param_init_fn(module)
             
             for child in module.children():
                 if not isinstance(child, CustomFSDP):
-                    apply_param_init_fn(child, param_init_fn)
+                    _apply_param_init_fn(child, param_init_fn)
  
-        apply_param_init_fn(self.module, param_init_fn)
+        _apply_param_init_fn(self.module, param_init_fn)
 
         start_idx = self.rank * shard_size
         end_idx = start_idx + shard_size
@@ -176,12 +176,11 @@ class CustomFSDP(torch.nn.Module):
         self._shard()
 
 
-    def _update_module_params(self, include_grads):
+    def _update_module_params(self, include_grads=False):
         is_sharded = self.flat_param.data_ptr() == self.local_shard.data_ptr()
         local_shard_size = self.local_shard.numel()
         offset = 0 - local_shard_size * self.rank if is_sharded else 0
 
-        # Update all parameters
         for name, numel, shape in zip(self.param_names, self.param_numels, self.param_shapes):
             data_tensor, grad_tensor = self._retrieve_data_and_grad_tensors(offset, numel, shape, is_sharded, local_shard_size, include_grads)
             self._assign_sliced_tensors_to_param(name, data_tensor, grad_tensor, include_grads)
