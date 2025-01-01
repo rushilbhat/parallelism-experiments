@@ -121,15 +121,10 @@ class CustomFSDP(torch.nn.Module):
 
         self._wrap_blocks(self.module, param_init_fn)
         self._record_param_metadata()
-
         self._create_and_shard_flat_param(param_init_fn)
 
         self.register_full_backward_pre_hook(lambda m, go: self._pre_backward())
         self._register_post_backward_hooks()        
-
-    @property
-    def module(self) -> nn.Module:
-        return self._fsdp_wrapped_module
         
     def _wrap_blocks(self, module, param_init_fn):
         for name, child in module.named_children():
@@ -181,6 +176,19 @@ class CustomFSDP(torch.nn.Module):
         self._shard()
 
 
+    def _update_module_params(self, include_grads):
+        is_sharded = self.flat_param.data_ptr() == self.local_shard.data_ptr()
+        local_shard_size = self.local_shard.numel()
+        offset = 0 - local_shard_size * self.rank if is_sharded else 0
+
+        # Update all parameters
+        for name, numel, shape in zip(self.param_names, self.param_numels, self.param_shapes):
+            data_tensor, grad_tensor = self._retrieve_data_and_grad_tensors(offset, numel, shape, is_sharded, local_shard_size, include_grads)
+            self._assign_sliced_tensors_to_param(name, data_tensor, grad_tensor, include_grads)
+            offset += numel
+
+        self._handle_shared_params()
+
     def _retrieve_data_and_grad_tensors(self, offset, numel, shape, is_sharded, local_shard_size, include_grads):
         if is_sharded:
             # Handle cases where parameter lies outside this shard
@@ -218,20 +226,7 @@ class CustomFSDP(torch.nn.Module):
                 submodule = reduce(getattr, module_path, self.module)
                 setattr(submodule, leaf, unique_params[original])
     
-    def _update_module_params(self, include_grads, flag=False):
-        is_sharded = self.flat_param.data_ptr() == self.local_shard.data_ptr()
-        local_shard_size = self.local_shard.numel()
-        offset = 0 - local_shard_size * self.rank if is_sharded else 0
-
-        # Update all parameters
-        for name, numel, shape in zip(self.param_names, self.param_numels, self.param_shapes):
-            data_tensor, grad_tensor = self._retrieve_data_and_grad_tensors(offset, numel, shape, is_sharded, local_shard_size, include_grads)
-            self._assign_sliced_tensors_to_param(name, data_tensor, grad_tensor, include_grads)
-            offset += numel
-
-        self._handle_shared_params()
-
-    def _gather(self, include_grads=False, flag=True):
+    def _gather(self, include_grads=False):
         full_tensor = torch.zeros(self.local_shard.numel() * self.world_size, device=self.local_shard.device)
         dist.all_gather_into_tensor(full_tensor, self.local_shard)
         self.flat_param.data = full_tensor
@@ -242,13 +237,17 @@ class CustomFSDP(torch.nn.Module):
 
         self._update_module_params(include_grads=include_grads)
 
-
-    def _shard(self, include_grads=False, flag=False):
+    def _shard(self, include_grads=False):
         self.flat_param.data = self.local_shard.data
         if include_grads:
             self.flat_param.grad = self.local_shard.grad
 
         self._update_module_params(include_grads=include_grads)
+
+    def _register_post_backward_hooks(self):
+        for name in self.param_names:
+            param = self._fsdp_wrapped_module.get_parameter(name)
+            param.register_post_accumulate_grad_hook(lambda p: self._post_backward())
 
     def _pre_backward(self):
         self.grad_counter = 0
@@ -263,12 +262,9 @@ class CustomFSDP(torch.nn.Module):
             self.local_shard.grad.add_(buffer)
             self._shard(include_grads=True)
 
-    def _register_post_backward_hooks(self):
-        for name in self.param_names:
-            param = dict(self._fsdp_wrapped_module.named_parameters())[name]
-            param.register_post_accumulate_grad_hook(lambda p: self._post_backward())
-
-
+    @property
+    def module(self) -> nn.Module:
+        return self._fsdp_wrapped_module
 
     @torch.no_grad()
     def clip_grad_norm_(self, max_norm):
