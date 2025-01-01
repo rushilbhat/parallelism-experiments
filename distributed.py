@@ -232,11 +232,9 @@ class CustomFSDP(torch.nn.Module):
         self._handle_shared_params()
 
     def _gather(self, include_grads=False, flag=True):
-        params_sharded = self.flat_param.data_ptr() == self.local_shard.data_ptr()
-        if params_sharded:
-            full_tensor = torch.zeros(self.local_shard.numel() * self.world_size, device=self.local_shard.device)
-            dist.all_gather_into_tensor(full_tensor, self.local_shard)
-            self.flat_param.data = full_tensor
+        full_tensor = torch.zeros(self.local_shard.numel() * self.world_size, device=self.local_shard.device)
+        dist.all_gather_into_tensor(full_tensor, self.local_shard)
+        self.flat_param.data = full_tensor
 
         if include_grads:
             full_grads_tensor = torch.zeros(self.local_shard.grad.numel() * self.world_size, device=self.local_shard.grad.device)
@@ -246,12 +244,11 @@ class CustomFSDP(torch.nn.Module):
 
 
     def _shard(self, include_grads=False, flag=False):
-        if self.flat_param.data_ptr() != self.local_shard.data_ptr(): #check if flat_params is not sharded
-            self.flat_param.data = self.local_shard.data
-            if include_grads:
-                self.flat_param.grad = self.local_shard.grad
+        self.flat_param.data = self.local_shard.data
+        if include_grads:
+            self.flat_param.grad = self.local_shard.grad
 
-            self._update_module_params(include_grads=include_grads)
+        self._update_module_params(include_grads=include_grads)
 
     def _pre_backward(self):
         self.grad_counter = 0
