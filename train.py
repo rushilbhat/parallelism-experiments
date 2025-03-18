@@ -100,12 +100,11 @@ if is_distributed:
             model = CustomFSDP(model, param_init_fn=model._init_weights, world_size=distributed_world_size, rank=distributed_rank)
         else: # pytorch
             def init_weights(module):
-                if module != model.lm_head:
-                    module.to_empty(device=torch.device(f'cuda:{distributed_local_rank}'), recurse=False)
-                    model._init_weights(module)
-
-                if module == model.transformer.wte:
-                    model.lm_head.weight = model.transformer.wte.weight
+                module.to_empty(device=torch.device(f'cuda:{distributed_local_rank}'), recurse=False)
+                model._init_weights(module)
+                
+                if module == model.lm_head:
+                    model.transformer.wte.weight = module.weight
 
             gpt2_auto_wrap_policy = functools.partial(
                 transformer_auto_wrap_policy,

@@ -6,6 +6,7 @@ import math
 import gc
 from model import Block
 from functools import reduce
+from collections import deque
 
 class Bucket:
     def __init__(self):
@@ -161,12 +162,16 @@ class CustomFSDP(torch.nn.Module):
         self._materialize_params()
         self._update_module_params(flag=True)
 
-        def _apply_param_init_fn(module, param_init_fn):
-            if not isinstance(module, CustomFSDP):
-                param_init_fn(module)
-            for child in module.children():
-                if not isinstance(child, CustomFSDP):
-                    _apply_param_init_fn(child, param_init_fn)
+        def _apply_param_init_fn(root_module, param_init_fn):
+            queue = deque([root_module])
+            while queue:
+                module = queue.popleft()
+                if not isinstance(module, CustomFSDP):
+                    param_init_fn(module)
+                for child in module.children():
+                    if not isinstance(child, CustomFSDP):
+                        queue.append(child)
+
  
         _apply_param_init_fn(self.module, param_init_fn)
 

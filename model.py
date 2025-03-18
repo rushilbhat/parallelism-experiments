@@ -99,8 +99,7 @@ class GPT(nn.Module):
             std = 0.02
             if hasattr(module, 'NANOGPT_SCALE_INIT'):
                 std *= (2 * self.config.n_layer) ** -0.5
-            if module != self.lm_head: 
-                torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
