@@ -134,7 +134,7 @@ if is_distributed:
                 module.to_empty(device=torch.device(f'cuda:{distributed_local_rank}'), recurse=False)
                 model._init_weights(module)
                 
-                if module == model.lm_head:
+                if module == model.lm_head and model.config.tie_word_embeddings:
                     model.transformer.wte.weight = module.weight
 
             gpt2_auto_wrap_policy = functools.partial(

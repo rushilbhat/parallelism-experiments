@@ -115,7 +115,6 @@ class CustomFSDP(torch.nn.Module):
         self.param_numels = []
         self.param_shapes = []
         self.param_names = []
-        self.shared_params = {} # Maps shared parameter names to their original parameter names
 
         self.flat_param = None
         self.local_shard = None
@@ -136,20 +135,11 @@ class CustomFSDP(torch.nn.Module):
                 self._wrap_blocks(child, param_init_fn)
 
     def _record_param_metadata(self):
-        all_params = {n: p for n, p in self.module.named_parameters(remove_duplicate=False) if '_fsdp_wrapped_module' not in n}
-        unique_params = {n: p for n, p in self.module.named_parameters() if '_fsdp_wrapped_module' not in n}
-
-        # Record shared parameters
-        if len(all_params) > len(unique_params):
-            param_id_to_name = {id(p): n for n, p in unique_params.items()}
-            self.shared_params.update({n: param_id_to_name[id(p)] for n, p in all_params.items() 
-                                     if param_id_to_name.get(id(p)) and param_id_to_name[id(p)] != n})
-
-        # Record parameter metadata
-        for n, p in unique_params.items():
-            self.param_numels.append(p.numel())
-            self.param_shapes.append(p.shape) 
-            self.param_names.append(n)
+        for n, p in self.module.named_parameters():
+            if '_fsdp_wrapped_module' not in n:
+                self.param_numels.append(p.numel())
+                self.param_shapes.append(p.shape) 
+                self.param_names.append(n)
 
     def _create_and_shard_flat_param(self, param_init_fn):
         total_numel = sum(self.param_numels)
@@ -189,10 +179,9 @@ class CustomFSDP(torch.nn.Module):
         for name in self.param_names:
             _replace_param(name, nn.Parameter(torch.empty(0, device='cuda')))
 
-        if len(self.shared_params) > 0:
-            for duplicate, original in self.shared_params.items():
-                _replace_param(duplicate, self.module.get_parameter(original))
-
+        if hasattr(self.module, 'config') and self.module.config.tie_word_embeddings:
+            self.module.lm_head.weight = self.module.transformer.wte.weight
+            
     def _update_module_params(self, include_grads=False, flag=False):
         is_sharded = self.flat_param.data_ptr() == self.local_shard.data_ptr()
         local_shard_size = self.local_shard.numel()

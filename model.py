@@ -73,6 +73,7 @@ class GPTConfig:
     n_layer: int = 12 # number of layers
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
+    tie_word_embeddings: bool = True
 
 class GPT(nn.Module):
 
@@ -89,7 +90,8 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         # weight sharing scheme
-        self.transformer.wte.weight = self.lm_head.weight
+        if config.tie_word_embeddings:
+            self.transformer.wte.weight = self.lm_head.weight
 
         # init params
         self.apply(self._init_weights)
