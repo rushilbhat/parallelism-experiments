@@ -22,6 +22,7 @@ from contextlib import nullcontext
 from model import GPT, GPTConfig, Block
 from data_loader import DataLoaderLite
 from distributed import CustomDDP, CustomFSDP
+from tensor_parallel import apply_tensor_parallelism
 
 def parse_args(is_distributed):
     parser = argparse.ArgumentParser(description='Training script with distributed options')
@@ -30,7 +31,12 @@ def parse_args(is_distributed):
                         default='ddp', help='Choose dataparallelization strategy: ddp or fsdp')
         parser.add_argument('--implementation', type=str, choices=['pytorch', 'custom'], 
                       default='pytorch', help='Choose distributed implementation: pytorch or custom')
-    
+        
+        parser.add_argument('--tensor_parallel_size', type=int, default=1, 
+                            help='Degree of tensor parallelism')
+        parser.add_argument('--data_parallel_size', type=int, default=1, 
+                            help='Degree of data parallelism')
+
     parser.add_argument('--gradient_clipping', action=argparse.BooleanOptionalAction)
     return parser.parse_args()
 
@@ -95,6 +101,31 @@ with device_context:
 param_dims = get_param_dims(model)
 
 if is_distributed:
+    tp_size = args.tensor_parallel_size
+    dp_size = args.data_parallel_size
+    assert tp_size * dp_size == distributed_world_size, "tp_size * dp_size must equal distributed_world_size"
+
+    dp_rank = distributed_rank // tp_size
+    tp_rank = distributed_rank % tp_size
+
+    tp_group_ranks = [dp_rank * tp_size + i for i in range(tp_size)]  
+    dp_group_ranks = [i * tp_size + tp_rank for i in range(dp_size)]
+    tp_group = dist.new_group(ranks=tp_group_ranks)
+    dp_group = dist.new_group(ranks=dp_group_ranks)
+
+    if tp_size > 1:
+        sharding_config = {
+            'attn.c_attn': 1,
+            'attn.c_proj': 0,
+            'mlp.c_fc': 1,
+            'mlp.c_proj': 0,
+        }
+        apply_tensor_parallelism(model, 
+                                 sharding_config, 
+                                 tp_group, 
+                                 reduce_row_output=True, 
+                                 gather_col_output=False)
+
     if args.data_parallel_type == "fsdp":
         if args.implementation == "custom":
             model = CustomFSDP(model, param_init_fn=model._init_weights, world_size=distributed_world_size, rank=distributed_rank)

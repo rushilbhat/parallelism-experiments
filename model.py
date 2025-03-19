@@ -32,7 +32,7 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, -1, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, -1, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        y = y.transpose(1, 2).contiguous().view(B, T, -1) # re-assemble all head outputs side by side
         # output projection
         y = self.c_proj(y)
         return y
@@ -137,6 +137,7 @@ class GPT(nn.Module):
         nodecay_params = []
         for n, p in param_dict.items():
             raw_name = n.replace('_fsdp_wrapped_module.', '') if '_fsdp_wrapped_module' in n else n
+            raw_name = raw_name.replace('linear.', '') if 'linear' in raw_name else raw_name # Crude fix for TP
             if param_dims[raw_name] >= 2:
                 decay_params.append(p)
             else:
