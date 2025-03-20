@@ -92,10 +92,13 @@ class Reducer:
 
 
 class CustomDDP(nn.Module):
-    def __init__(self, module, world_size, bucket_cap_mb=25): 
+    def __init__(self, module, process_group, bucket_cap_mb=25): 
         super().__init__()
+        self.process_group = process_group
+        self.world_size = dist.get_world_size(self.process_group)
+
         self.module = module
-        self.reducer = Reducer(self.module.named_parameters(), bucket_cap_mb, world_size)
+        self.reducer = Reducer(self.module.named_parameters(), bucket_cap_mb, self.world_size)
 
     def set_require_backward_grad_sync(self, require_sync):
         self.reducer.require_backward_grad_sync = require_sync
@@ -105,10 +108,11 @@ class CustomDDP(nn.Module):
     
 
 class CustomFSDP(torch.nn.Module):
-    def __init__(self, module, param_init_fn, world_size, rank):
+    def __init__(self, module, process_group, param_init_fn):
         super().__init__()
-        self.world_size = world_size
-        self.rank = rank
+        self.process_group = process_group
+        self.world_size = dist.get_world_size(self.process_group)
+        self.rank = dist.get_rank(self.process_group)
 
         self._fsdp_wrapped_module = module
 
@@ -129,7 +133,7 @@ class CustomFSDP(torch.nn.Module):
     def _wrap_blocks(self, module, param_init_fn):
         for name, child in module.named_children():
             if isinstance(child, Block):
-                fsdp_unit = CustomFSDP(child, param_init_fn, self.world_size, self.rank)
+                fsdp_unit = CustomFSDP(child, self.process_group, param_init_fn)
                 setattr(module, name, fsdp_unit)
             else:
                 self._wrap_blocks(child, param_init_fn)

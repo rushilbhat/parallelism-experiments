@@ -128,7 +128,7 @@ if is_distributed:
 
     if args.data_parallel_type == "fsdp":
         if args.implementation == "custom":
-            model = CustomFSDP(model, param_init_fn=model._init_weights, world_size=distributed_world_size, rank=distributed_rank)
+            model = CustomFSDP(model, process_group=dp_group, param_init_fn=model._init_weights)
         else: # pytorch
             def init_weights(module):
                 module.to_empty(device=torch.device(f'cuda:{distributed_local_rank}'), recurse=False)
@@ -145,12 +145,12 @@ if is_distributed:
             )
             # state_dict = torch.load('model_weights.pth')
             # model.load_state_dict(state_dict)
-            model = FSDP(model, auto_wrap_policy=gpt2_auto_wrap_policy, use_orig_params=True, param_init_fn=init_weights)
+            model = FSDP(model, process_group=dp_group, auto_wrap_policy=gpt2_auto_wrap_policy, use_orig_params=True, param_init_fn=init_weights)
     elif args.data_parallel_type == "ddp":
         if args.implementation == "custom":
-            model = CustomDDP(model.to(device), distributed_world_size)
+            model = CustomDDP(model.to(device), dp_group)
         else: # pytorch
-            model = DDP(model.to(device), device_ids=[distributed_local_rank])
+            model = DDP(model.to(device), device_ids=[dist.get_rank(dp_group)])
 
     if master_process: print(f"using {args.data_parallel_type} implementation: {args.implementation}")
 else:
