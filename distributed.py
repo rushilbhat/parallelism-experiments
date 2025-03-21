@@ -58,7 +58,7 @@ class Reducer:
 
     def _reduce_bucket(self, bucket):
         flat_grads = torch.cat([param.grad.flatten() for param in bucket.parameters.values()])
-        future = dist.all_reduce(flat_grads, async_op=True)
+        future = dist.all_reduce(flat_grads, group=self.process_group, async_op=True)
         self.futures.append((future, bucket))
         self.reduced_buckets_count += 1
 
@@ -219,7 +219,7 @@ class CustomFSDP(torch.nn.Module):
     
     def _gather(self, include_grads=False):
         full_tensor = torch.zeros(self.local_shard.numel() * self.world_size, device=self.local_shard.device)
-        dist.all_gather_into_tensor(full_tensor, self.local_shard)
+        dist.all_gather_into_tensor(full_tensor, self.local_shard, group=self.process_group)
         self.flat_param.data = full_tensor
 
         if include_grads:
@@ -249,7 +249,7 @@ class CustomFSDP(torch.nn.Module):
         if self.grad_counter == len(list(self.param_names)):
             grad_shards = list(self.flat_param.grad.chunk(self.world_size))
             buffer = torch.empty(self.local_shard.shape, device='cuda')
-            dist.reduce_scatter(buffer, grad_shards, op=dist.ReduceOp.AVG)
+            dist.reduce_scatter(buffer, grad_shards, op=dist.ReduceOp.AVG, group=self.process_group)
             self.local_shard.grad.add_(buffer)
             self._shard(include_grads=True)
 
@@ -271,7 +271,7 @@ class CustomFSDP(torch.nn.Module):
             dtype=torch.float32
         )
         sqaured_norm = local_grad_norm ** 2.0
-        dist.all_reduce(sqaured_norm) 
+        dist.all_reduce(sqaured_norm, group=self.process_group) 
         global_grad_norm = sqaured_norm ** (1.0 / 2.0)
         clip_coef = max_norm / (global_grad_norm + 1e-6)
         if clip_coef < 1.0:

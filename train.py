@@ -105,13 +105,13 @@ if is_distributed:
     dp_size = args.data_parallel_size
     assert tp_size * dp_size == distributed_world_size, "tp_size * dp_size must equal distributed_world_size"
 
-    dp_rank = distributed_rank // tp_size
     tp_rank = distributed_rank % tp_size
+    dp_rank = distributed_rank // tp_size
 
-    tp_group_ranks = [dp_rank * tp_size + i for i in range(tp_size)]  
-    dp_group_ranks = [i * tp_size + tp_rank for i in range(dp_size)]
-    tp_group = dist.new_group(ranks=tp_group_ranks)
-    dp_group = dist.new_group(ranks=dp_group_ranks)
+    tp_groups = [dist.new_group([tp + dp * tp_size for tp in range(tp_size)]) for dp in range(dp_size)]
+    dp_groups = [dist.new_group([dp * tp_size + tp for dp in range(dp_size)]) for tp in range(tp_size)]
+    tp_group = tp_groups[dp_rank]
+    dp_group = dp_groups[tp_rank]
 
     if tp_size > 1:
         sharding_config = {
