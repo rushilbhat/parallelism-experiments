@@ -89,6 +89,12 @@ def apply_tensor_parallelism(model: nn.Module,
                             tp_group,
                             reduce_row_output=False,
                             gather_col_output=False):
+    
+    config = model.config
+    tp_size = dist.get_world_size(tp_group)
+    assert config.n_embd % tp_size == 0, f"n_embd={config.n_embd} is not divisible by TP size {tp_size}."
+    assert config.n_head % tp_size == 0, f"n_head={config.n_head} is not divisible by TP size {tp_size}."
+
     for fname, module in list(model.named_modules()):
         if isinstance(module, nn.Linear):
             for linear_layer_name, split_dim in sharding_config.items():

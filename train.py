@@ -21,7 +21,7 @@ from contextlib import nullcontext
 
 from model import GPT, GPTConfig, Block
 from data_loader import DataLoaderLite
-from distributed import CustomDDP, CustomFSDP
+from distributed import CustomDDP, CustomFSDP, clip_grad_norm
 from tensor_parallel import apply_tensor_parallelism
 
 def parse_args(is_distributed):
@@ -76,16 +76,43 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
+dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
+
+# Set up DP/TP if distributed
+if is_distributed:
+    dp_size = args.data_parallel_size
+    tp_size = args.tensor_parallel_size
+    assert dp_size * tp_size == distributed_world_size, "dp_size * tp_size must equal distributed_world_size"
+
+    tp_rank = distributed_rank % tp_size
+    dp_rank = distributed_rank // tp_size
+
+    tp_groups = [dist.new_group([tp + dp * tp_size for tp in range(tp_size)]) for dp in range(dp_size)]
+    dp_groups = [dist.new_group([dp * tp_size + tp for dp in range(dp_size)]) for tp in range(tp_size)]
+    tp_group = tp_groups[dp_rank]
+    dp_group = dp_groups[tp_rank]
+
+    if master_process:
+        print(f"Running with DP size={dp_size} and TP size={tp_size}")
+        print(f"This rank = {distributed_rank}, dp_rank={dp_rank}, tp_rank={tp_rank}")
+else:
+    dp_size = 1
+    tp_size = 1
+    dp_rank = 0
+    tp_rank = 0
+    tp_group = None
+    dp_group = None
+
 total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
 B = 8 # micro batch size CHANGE
 T = 1024 # sequence length
-assert total_batch_size % (B * T * distributed_world_size) == 0, "make sure total_batch_size is divisible by B * T * distributed_world_size"
-grad_accum_steps = total_batch_size // (B * T * distributed_world_size)
+assert total_batch_size % (B * T * dp_size) == 0, "make sure total_batch_size is divisible by B * T * data parallel size"
+grad_accum_steps = total_batch_size // (B * T * dp_size)
 if master_process:
     print(f"total desired batch size: {total_batch_size}")
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-train_loader = DataLoaderLite(B=B, T=T, process_rank=distributed_rank, num_processes=distributed_world_size, master_process=master_process)
+train_loader = DataLoaderLite(B=B, T=T, process_rank=dp_rank, num_processes=dp_size, master_process=master_process)
 
 torch.set_float32_matmul_precision('highest')
 
@@ -101,18 +128,6 @@ with device_context:
 param_dims = get_param_dims(model)
 
 if is_distributed:
-    tp_size = args.tensor_parallel_size
-    dp_size = args.data_parallel_size
-    assert tp_size * dp_size == distributed_world_size, "tp_size * dp_size must equal distributed_world_size"
-
-    tp_rank = distributed_rank % tp_size
-    dp_rank = distributed_rank // tp_size
-
-    tp_groups = [dist.new_group([tp + dp * tp_size for tp in range(tp_size)]) for dp in range(dp_size)]
-    dp_groups = [dist.new_group([dp * tp_size + tp for dp in range(dp_size)]) for tp in range(tp_size)]
-    tp_group = tp_groups[dp_rank]
-    dp_group = dp_groups[tp_rank]
-
     if tp_size > 1:
         sharding_config = {
             'attn.c_attn': 1,
@@ -176,6 +191,7 @@ def get_lr(it):
     return min_lr + coeff * (max_lr - min_lr)
 
 # optimize!
+scaler = torch.GradScaler('cuda', enabled=(dtype == 'bfloat16'))
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type, param_dims=param_dims, master_process=master_process)
 
 # create the log directory we will write checkpoints to and log to
@@ -211,18 +227,25 @@ for step in range(max_steps):
             # instead of a SUM we want MEAN. Scale the loss here so it comes out right
             loss = loss / grad_accum_steps
             loss_accum += loss.detach()
-            loss.backward()
+            scaler.scale(loss).backward()
     if is_distributed:
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
 
     if args.gradient_clipping:
-        norm = model.clip_grad_norm_(max_norm=1.0) if is_distributed and args.data_parallel_type == "fsdp" else torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    
+        scaler.unscale_(optimizer)
+        if is_distributed and args.data_parallel_type == "fsdp" and tp_size > 1:
+            norm = clip_grad_norm(model, max_norm=1.0, tp_group=tp_group, dp_group=dp_group)
+        elif is_distributed and args.data_parallel_type == "fsdp":
+            norm = model.clip_grad_norm_(max_norm=1.0)
+        else:
+            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
     # determine and set the learning rate for this iteration
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
-    optimizer.step()
+    scaler.step(optimizer)
+    scaler.update()
     if device_type == "cuda":
         torch.cuda.synchronize() # wait for the GPU to finish work
     t1 = time.time()
