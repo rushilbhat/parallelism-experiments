@@ -38,17 +38,36 @@ class ColParallelLinear(nn.Module):
         self.tp_group = tp_group
         self.gather_output = gather_output
         self.tp_world_size = dist.get_world_size(tp_group)
+        self.tp_rank = dist.get_rank(tp_group)
 
         local_out_features = self.linear.out_features // self.tp_world_size
         in_features = self.linear.in_features
-        device = self.linear.weight.device
-        dtype = self.linear.weight.dtype
 
-        self.linear.weight = nn.Parameter(torch.empty(local_out_features, in_features, device=device, dtype=dtype))
+        sharded_weight = nn.Parameter(torch.empty(local_out_features, 
+                                                  in_features, 
+                                                  device=self.linear.weight.device, 
+                                                  dtype=self.linear.weight.dtype
+                                                  ))
+        
+        start_idx = self.tp_rank * local_out_features
+        end_idx = start_idx + local_out_features
+
+        if self.linear.weight.device.type != 'meta':
+            sharded_weight.data.copy_(self.linear.weight.data[start_idx:end_idx])
+        self.linear.weight = sharded_weight
+
         if self.linear.bias is not None:
-            self.linear.bias = nn.Parameter(torch.empty(local_out_features, device=device, dtype=dtype))
+            sharded_bias = nn.Parameter(torch.empty(local_out_features, 
+                                                    device=self.linear.bias.device, 
+                                                    dtype=self.linear.bias.dtype))
+            if self.linear.bias.device.type != 'meta':
+                sharded_bias.data.copy_(self.linear.bias.data[start_idx:end_idx])
+            self.linear.bias = sharded_bias
 
     def forward(self, x: torch.Tensor):
+        if x._backward_hooks is None:
+            x.register_hook(lambda grad: dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=self.tp_group))
+
         local_output = self.linear(x)
 
         if self.gather_output:
@@ -66,15 +85,31 @@ class RowParallelLinear(nn.Module):
         self.tp_group = tp_group
         self.reduce_output = reduce_output
         self.tp_world_size = dist.get_world_size(tp_group)
+        self.tp_rank = dist.get_rank(tp_group)
 
         local_in_features = self.linear.in_features // self.tp_world_size
         out_features = self.linear.out_features
-        device = self.linear.weight.device
-        dtype = self.linear.weight.dtype
 
-        self.linear.weight = nn.Parameter(torch.empty(out_features, local_in_features, device=device, dtype=dtype))
+        sharded_weight = nn.Parameter(torch.empty(out_features, 
+                                                  local_in_features, 
+                                                  device=self.linear.weight.device, 
+                                                  dtype=self.linear.weight.dtype
+                                                  ))
+
+        start_idx = self.tp_rank * local_in_features
+        end_idx = start_idx + local_in_features
+
+        if self.linear.weight.device.type != 'meta':
+            sharded_weight.data.copy_(self.linear.weight.data[:, start_idx:end_idx])
+        self.linear.weight = sharded_weight
+
         if self.linear.bias is not None:
-            self.linear.bias = nn.Parameter(torch.empty(out_features, device=device, dtype=dtype))
+            sharded_bias = nn.Parameter(torch.empty(out_features, 
+                                                    device=self.linear.bias.device, 
+                                                    dtype=self.linear.bias.dtype))
+            if self.linear.bias.device.type != 'meta':
+                sharded_bias.data.copy_(self.linear.bias.data)
+            self.linear.bias = sharded_bias
 
     def forward(self, x: torch.Tensor):
         local_output = self.linear(x)

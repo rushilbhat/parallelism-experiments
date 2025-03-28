@@ -288,25 +288,40 @@ class CustomFSDP(torch.nn.Module):
         return output
     
 @torch.no_grad()
-def clip_grad_norm(model, max_norm, tp_group, dp_group):
-    tp_params = set()
-    non_tp_params = set()
-    for module in model.modules():
-        if isinstance(module, (RowParallelLinear, ColParallelLinear)):
-            tp_params.update(module.parameters())
-        else:
-            non_tp_params.update(module.parameters(recurse=False))
-    
-    tp_squared_grad_norm = sum(p.grad.pow(2).sum() for p in tp_params if p.grad is not None)
-    non_tp_squared_grad_norm = sum(p.grad.pow(2).sum() for p in non_tp_params if p.grad is not None)
+def clip_grad_norm(model, max_norm, tp_group, dp_group, dp_type):
+    if dist.get_world_size(tp_group) > 1:
+        tp_sharded_params = set()
+        tp_replicated_params = set()
 
-    if isinstance(tp_squared_grad_norm, torch.Tensor):
-        dist.all_reduce(tp_squared_grad_norm, group=tp_group)
+        def separate_tp_sharded_params(module):
+            for name, child in module.named_children():
+                if isinstance(child, (RowParallelLinear)):
+                    tp_sharded_params.add(child.linear.weight)
+                    tp_replicated_params.add(child.linear.bias)
+                elif isinstance(child, (ColParallelLinear)):
+                    tp_sharded_params.add(child.linear.weight)
+                    tp_sharded_params.add(child.linear.bias)
+                else:                                                                         
+                    for n, p in child.named_parameters(recurse=False):
+                        tp_replicated_params.add(p)
+                    separate_tp_sharded_params(child)
+
+        separate_tp_sharded_params(model)
+
+
+        tp_sharded_squared_grad_norm = sum(p.grad.pow(2).sum() for p in tp_sharded_params if p.grad is not None)
+        dist.all_reduce(tp_sharded_squared_grad_norm, group=tp_group)
+        tp_replicated_squared_grad_norm = sum(p.grad.pow(2).sum() for p in tp_replicated_params if p.grad is not None)
+        total_squared_grad_norm = tp_sharded_squared_grad_norm + tp_replicated_squared_grad_norm
+
+        if dist.get_world_size(dp_group) > 1 and dp_type == "fsdp":
+            dist.all_reduce(total_squared_grad_norm, group=dp_group)
+
+    else:
+        total_squared_grad_norm = sum(p.grad.pow(2).sum() for p in model.parameters() if p.grad is not None)
+        if dist.get_world_size(dp_group) > 1 and dp_type == "fsdp":
+            dist.all_reduce(total_squared_grad_norm, group=dp_group)
         
-    total_squared_grad_norm = tp_squared_grad_norm + non_tp_squared_grad_norm
-    if dist.get_world_size(dp_group) > 1:
-        dist.all_reduce(total_squared_grad_norm, group=dp_group)
-    
     grad_norm = total_squared_grad_norm ** 0.5
     clip_coef = max_norm / (grad_norm + 1e-6)
     if clip_coef < 1.0:

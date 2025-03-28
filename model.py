@@ -11,7 +11,9 @@ class CausalSelfAttention(nn.Module):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        self.c_attn1 = nn.Linear(config.n_embd, config.n_embd)
+        self.c_attn2 = nn.Linear(config.n_embd, config.n_embd)
+        self.c_attn3 = nn.Linear(config.n_embd, config.n_embd)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
         self.c_proj.NANOGPT_SCALE_INIT = 1
@@ -25,16 +27,19 @@ class CausalSelfAttention(nn.Module):
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         # nh is "number of heads", hs is "head size", and C (number of channels) = nh * hs
         # e.g. in GPT-2 (124M), n_head=12, hs=64, so nh*hs=C=768 channels in the Transformer
-        qkv = self.c_attn(x)
+        q = self.c_attn1(x)
+        k = self.c_attn2(x)
+        v = self.c_attn3(x)
+    
         # q, k, v = qkv.split(self.n_embd, dim=2)
-        q, k, v = torch.chunk(qkv, 3, dim=2)
+        # q, k, v = torch.chunk(qkv, 3, dim=2)
         k = k.view(B, T, -1, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, -1, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, -1, self.head_dim).transpose(1, 2) # (B, nh, T, hs)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
         y = y.transpose(1, 2).contiguous().view(B, T, -1) # re-assemble all head outputs side by side
         # output projection
-        y = self.c_proj(y)
+        y = self.c_proj(y)    
         return y
 
 class MLP(nn.Module):
