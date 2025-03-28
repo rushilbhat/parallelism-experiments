@@ -7,6 +7,8 @@
 
 # run the training loop
 import os
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
 import time
 import math
 import torch
@@ -23,6 +25,8 @@ from model import GPT, GPTConfig, Block
 from data_loader import DataLoaderLite
 from distributed import CustomDDP, CustomFSDP, clip_grad_norm
 from tensor_parallel import apply_tensor_parallelism
+
+torch.use_deterministic_algorithms(True)
 
 def parse_args(is_distributed):
     parser = argparse.ArgumentParser(description='Training script with distributed options')
