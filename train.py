@@ -133,17 +133,8 @@ param_dims = get_param_dims(model)
 
 if is_distributed:
     if tp_size > 1:
-        sharding_config = {
-            'attn.c_attn1': 1, 'attn.c_attn2': 1, 'attn.c_attn3': 1,
-            'attn.c_proj': 0,
-            'mlp.c_fc': 1,
-            'mlp.c_proj': 0,
-        }
         apply_tensor_parallelism(model, 
-                                 sharding_config, 
-                                 tp_group, 
-                                 reduce_row_output=True, 
-                                 gather_col_output=False)
+                                 tp_group)
         
         if device_context.type == 'cpu':
             model.to(device)

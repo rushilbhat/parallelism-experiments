@@ -7,7 +7,7 @@ import gc
 from model import Block
 from functools import reduce
 from collections import deque
-from tensor_parallel import RowParallelLinear, ColParallelLinear
+from tensor_parallel import RowParallelLinear, ColParallelLinear, VocabParallelEmbedding
 class Bucket:
     def __init__(self):
         self.parameters = {}
@@ -296,10 +296,15 @@ def clip_grad_norm(model, max_norm, tp_group, dp_group, dp_type):
             for name, child in module.named_children():
                 if isinstance(child, (RowParallelLinear)):
                     tp_sharded_params.append(child.linear.weight)
-                    tp_replicated_params.append(child.linear.bias)
+                    if child.linear.bias is not None:
+                        tp_replicated_params.append(child.linear.bias)
                 elif isinstance(child, (ColParallelLinear)):
-                    tp_sharded_params.append(child.linear.weight)
-                    tp_sharded_params.append(child.linear.bias)
+                    if not (model.config.tie_word_embeddings and child == model.lm_head):
+                        tp_sharded_params.append(child.linear.weight)
+                        if child.linear.bias is not None:
+                            tp_sharded_params.append(child.linear.bias)
+                elif isinstance(child, (VocabParallelEmbedding)):
+                    tp_sharded_params.append(child.embedding.weight)
                 else:                                                                         
                     for n, p in child.named_parameters(recurse=False):
                         if not (model.config.tie_word_embeddings and child == model.lm_head):

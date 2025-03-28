@@ -119,29 +119,79 @@ class RowParallelLinear(nn.Module):
 
         return local_output
 
+class VocabParallelEmbedding(nn.Module):
+    def __init__(self, embedding, tp_group):
+        super().__init__()
+        self.embedding = embedding
+        self.tp_group = tp_group
+        self.tp_world_size = dist.get_world_size(tp_group)
+        self.tp_rank = dist.get_rank(tp_group)
+
+        self.local_num_embeddings = embedding.num_embeddings // self.tp_world_size
+        self.vocab_start_idx = self.tp_rank * self.local_num_embeddings
+        self.vocab_end_idx = self.vocab_start_idx + self.local_num_embeddings
+
+        embedding_dim = embedding.embedding_dim
+
+        sharded_weight = nn.Parameter(torch.empty(self.local_num_embeddings, 
+                                                  embedding_dim,
+                                                  device=embedding.weight.device,
+                                                  dtype=embedding.weight.dtype))
+        
+        if self.embedding.weight.device.type != 'meta':
+            sharded_weight.data.copy_(self.embedding.weight.data[self.vocab_start_idx:self.vocab_end_idx])
+        self.embedding.weight = sharded_weight
+
+        
+    def forward(self, input_ids):
+        local_mask = (input_ids >= self.vocab_start_idx) & (input_ids < self.vocab_end_idx)    
+        local_ids = input_ids - self.vocab_start_idx
+        clamped_local_ids = torch.clamp(local_ids, 0, self.local_num_embeddings - 1)
+        local_output = self.embedding(clamped_local_ids)
+        local_output = local_output * local_mask.float().unsqueeze(-1)
+        
+        local_output = DifferentiableAllReduce.apply(local_output, self.tp_group)
+
+        return local_output
+
+
 def apply_tensor_parallelism(model: nn.Module,
-                            sharding_config: dict,
                             tp_group,
-                            reduce_row_output=False,
-                            gather_col_output=False):
+                            enable_loss_parallelism=False):
     
+    sharding_map = {
+        'attn.c_attn1':  {'type': 'col', 'gather_output': False},
+        'attn.c_attn2':  {'type': 'col', 'gather_output': False},
+        'attn.c_attn3':  {'type': 'col', 'gather_output': False},
+        'attn.c_proj':  {'type': 'row', 'reduce_output': True},
+        'mlp.c_fc':     {'type': 'col', 'gather_output': False},
+        'mlp.c_proj':   {'type': 'row', 'reduce_output': True},
+        'wte':          {'type': 'vocab'},
+        'lm_head':      {'type': 'col', 'gather_output': False if enable_loss_parallelism else True},
+    }
+
     config = model.config
     tp_size = dist.get_world_size(tp_group)
     assert config.n_embd % tp_size == 0, f"n_embd={config.n_embd} is not divisible by TP size {tp_size}."
     assert config.n_head % tp_size == 0, f"n_head={config.n_head} is not divisible by TP size {tp_size}."
 
-    for fname, module in list(model.named_modules()):
-        if isinstance(module, nn.Linear):
-            for linear_layer_name, split_dim in sharding_config.items():
-                if fname.endswith(linear_layer_name):
-                    if split_dim == 0:
-                        new_child = RowParallelLinear(module, reduce_row_output, tp_group)
-                    elif split_dim == 1:
-                        new_child = ColParallelLinear(module, gather_col_output, tp_group)
+    for module_name, module in list(model.named_modules()):
+        if isinstance(module, nn.Linear) or isinstance(module, nn.Embedding):
+            for key, shard_info in sharding_map.items():
+                if module_name.endswith(key):
+                    if shard_info['type'] == 'row':
+                        new_child = RowParallelLinear(module, shard_info.get('reduce_output', False), tp_group)
+                    elif shard_info['type'] == 'col':
+                        new_child = ColParallelLinear(module, shard_info.get('gather_output', False), tp_group)
+                    elif shard_info['type'] == 'vocab':
+                        new_child = VocabParallelEmbedding(module, tp_group)
                     else:
-                        raise ValueError(f"Invalid shard dimension {split_dim} for {module}")
+                        raise ValueError(f"Invalid shard type {shard_info['type']}")
                     
-                    *parent_path, leaf = fname.split('.')
+                    *parent_path, leaf = module_name.split('.')
                     parent_module = reduce(getattr, parent_path, model)
                     setattr(parent_module, leaf, new_child)
                     break
+
+    if config.tie_word_embeddings:
+        model.transformer.wte.embedding.weight = model.lm_head.linear.weight

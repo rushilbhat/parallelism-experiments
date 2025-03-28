@@ -145,6 +145,7 @@ class GPT(nn.Module):
         for n, p in param_dict.items():
             raw_name = n.replace('_fsdp_wrapped_module.', '') if '_fsdp_wrapped_module' in n else n
             raw_name = raw_name.replace('linear.', '') if 'linear' in raw_name else raw_name # Crude fix for TP
+            raw_name = raw_name.replace('embedding.', '') if 'embedding' in raw_name else raw_name # Crude fix for TP
             if param_dims[raw_name] >= 2:
                 decay_params.append(p)
             else:
