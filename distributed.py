@@ -290,20 +290,20 @@ class CustomFSDP(torch.nn.Module):
 @torch.no_grad()
 def clip_grad_norm(model, max_norm, tp_group, dp_group, dp_type):
     if dist.get_world_size(tp_group) > 1:
-        tp_sharded_params = set()
-        tp_replicated_params = set()
-
+        tp_sharded_params  = []
+        tp_replicated_params = []
         def separate_tp_sharded_params(module):
             for name, child in module.named_children():
                 if isinstance(child, (RowParallelLinear)):
-                    tp_sharded_params.add(child.linear.weight)
-                    tp_replicated_params.add(child.linear.bias)
+                    tp_sharded_params.append(child.linear.weight)
+                    tp_replicated_params.append(child.linear.bias)
                 elif isinstance(child, (ColParallelLinear)):
-                    tp_sharded_params.add(child.linear.weight)
-                    tp_sharded_params.add(child.linear.bias)
+                    tp_sharded_params.append(child.linear.weight)
+                    tp_sharded_params.append(child.linear.bias)
                 else:                                                                         
                     for n, p in child.named_parameters(recurse=False):
-                        tp_replicated_params.add(p)
+                        if not (model.config.tie_word_embeddings and child == model.lm_head):
+                            tp_replicated_params.append(p)
                     separate_tp_sharded_params(child)
 
         separate_tp_sharded_params(model)
