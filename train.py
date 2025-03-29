@@ -12,6 +12,7 @@ os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 import time
 import math
 import torch
+import torch.nn.functional as F
 import argparse
 import functools
 from torch.distributed import init_process_group, destroy_process_group
@@ -24,7 +25,7 @@ from contextlib import nullcontext
 from model import GPT, GPTConfig, Block
 from data_loader import DataLoaderLite
 from distributed import CustomDDP, CustomFSDP, clip_grad_norm
-from tensor_parallel import apply_tensor_parallelism
+from tensor_parallel import apply_tensor_parallelism, vocab_parallel_cross_entropy_loss
 
 torch.use_deterministic_algorithms(True)
 
@@ -33,6 +34,8 @@ def parse_args(is_distributed):
     if is_distributed:
         parser.add_argument('--tensor_parallel_size', type=int, default=1, 
                             help='Degree of tensor parallelism')
+        parser.add_argument('--enable_loss_parallelism', action=argparse.BooleanOptionalAction, 
+                            help='Enable loss parallelism')
         parser.add_argument('--data_parallel_size', type=int, default=1, 
                             help='Degree of data parallelism')
         parser.add_argument('--data_parallel_type', type=str, choices=['ddp', 'fsdp'], 
@@ -134,7 +137,8 @@ param_dims = get_param_dims(model)
 if is_distributed:
     if tp_size > 1:
         apply_tensor_parallelism(model, 
-                                 tp_group)
+                                 tp_group,
+                                 enable_loss_parallelism=args.enable_loss_parallelism)
         
         if device_context.type == 'cpu':
             model.to(device)
@@ -217,7 +221,11 @@ for step in range(max_steps):
         
         with grad_sync_context:
             with torch.autocast(device_type=device_type, dtype=torch.bfloat16 if HAS_BF16 else torch.float16):
-                logits, loss = model(x, y)
+                logits = model(x)
+                if tp_size > 1 and args.enable_loss_parallelism:
+                    loss = vocab_parallel_cross_entropy_loss(logits, y, tp_group)
+                else:
+                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
             # we have to scale the loss to account for gradient accumulation,
             # because the gradients just add on each successive backward().
             # addition of gradients corresponds to a SUM in the objective, but
