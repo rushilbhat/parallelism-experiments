@@ -26,13 +26,6 @@ class DifferentiableAllReduce(torch.autograd.Function):
         ctx.op = op
         if op == 'sum':
             dist.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group)
-        # elif op == 'max':
-        #     pre_reduce = tensor.clone()
-        #     dist.all_reduce(tensor, op=dist.ReduceOp.MAX, group=group)
-        #     mask = (pre_reduce == tensor).float()
-        #     count_mask = mask.clone()
-        #     dist.all_reduce(count_mask, op=dist.ReduceOp.SUM, group=group)
-        #     ctx.save_for_backward(mask, count_mask)
         else:
             raise ValueError(f"Unsupported reduce op. Use dist.ReduceOp.SUM or dist.ReduceOp.MAX.")
         return tensor
@@ -41,10 +34,6 @@ class DifferentiableAllReduce(torch.autograd.Function):
     def backward(ctx, grad_output):
         if ctx.op == 'sum':
             return grad_output, None, None
-        # elif ctx.op == 'max':
-        #     mask, count_mask = ctx.saved_tensors
-        #     grad_input = grad_output * mask / count_mask
-        #     return grad_input, None, None
 
 
 class ColParallelLinear(nn.Linear):
@@ -139,19 +128,10 @@ def vocab_parallel_cross_entropy_loss(logits, targets, tp_group, ignore_index=-1
     vocab_start_idx = tp_rank * local_vocab_size
     vocab_end_idx = vocab_start_idx + local_vocab_size
 
-    # local_logits_max, _ = logits.max(dim=-1, keepdim=True)
-    # global_logits_max = DifferentiableAllReduce.apply(local_logits_max, 'max', tp_group)
-    # shifted_logits = logits - global_logits_max
-    # No need to backpropagating through logits_max since the subtracting the max is a constant and will not affect the gradient
-    logits_max = logits.detach().max(dim=-1, keepdim=True)[0]        
-    dist.all_reduce(logits_max, op=dist.ReduceOp.MAX, group=tp_group)
-    shifted_logits = logits - logits_max
-    exp_logits = torch.exp(shifted_logits)
-    
-    local_sum = exp_logits.sum(dim=-1, keepdim=True)
+    exp_logits = torch.exp(logits)
+    local_sum = exp_logits.sum(dim=-1)
     global_sum = DifferentiableAllReduce.apply(local_sum, 'sum', tp_group)
-    logsum = torch.log(global_sum)
-    log_probs = shifted_logits - logsum
+    logsumexp = torch.log(global_sum)
 
     ignore_mask = (targets != ignore_index)
     local_mask = (targets >= vocab_start_idx) & (targets < vocab_end_idx) & ignore_mask
@@ -159,13 +139,14 @@ def vocab_parallel_cross_entropy_loss(logits, targets, tp_group, ignore_index=-1
     local_targets = targets - vocab_start_idx
     local_targets = local_targets.clamp(0, local_vocab_size - 1)
 
-    local_pred_log_probs = torch.gather(log_probs, dim=-1, index=local_targets.unsqueeze(-1)).squeeze(-1)
-    local_pred_log_probs = local_pred_log_probs * local_mask.float()
-
-    local_loss = local_pred_log_probs.sum()
-    global_loss = DifferentiableAllReduce.apply(local_loss, 'sum', tp_group)
+    pred_logits = torch.gather(logits, dim=-1, index=local_targets.unsqueeze(-1)).squeeze(-1)
+    pred_logits = pred_logits * local_mask.float()
+    pred_logits = DifferentiableAllReduce.apply(pred_logits, 'sum', tp_group)
+    pred_logprobs = logsumexp - pred_logits
+    
+    nll_loss = pred_logprobs.sum()
     valid_count = ignore_mask.float().sum()
-    avg_nll_loss = -global_loss / valid_count
+    avg_nll_loss = nll_loss / valid_count
 
     return avg_nll_loss
 
