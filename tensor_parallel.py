@@ -47,44 +47,28 @@ class DifferentiableAllReduce(torch.autograd.Function):
         #     return grad_input, None, None
 
 
-class ColParallelLinear(nn.Module):
-    def __init__(self, linear, gather_output, tp_group):
-        super().__init__()
-        self.linear = linear
+class ColParallelLinear(nn.Linear):
+    def __init__(self, in_features, out_features, bias, device, dtype, gather_output, tp_group):
         self.tp_group = tp_group
-        self.gather_output = gather_output
         self.tp_world_size = dist.get_world_size(tp_group)
         self.tp_rank = dist.get_rank(tp_group)
+        self.gather_output = gather_output
 
-        local_out_features = self.linear.out_features // self.tp_world_size
-        in_features = self.linear.in_features
-
-        sharded_weight = nn.Parameter(torch.empty(local_out_features, 
-                                                  in_features, 
-                                                  device=self.linear.weight.device, 
-                                                  dtype=self.linear.weight.dtype
-                                                  ))
-        
-        start_idx = self.tp_rank * local_out_features
-        end_idx = start_idx + local_out_features
-
-        if self.linear.weight.device.type != 'meta':
-            sharded_weight.data.copy_(self.linear.weight.data[start_idx:end_idx])
-        self.linear.weight = sharded_weight
-
-        if self.linear.bias is not None:
-            sharded_bias = nn.Parameter(torch.empty(local_out_features, 
-                                                    device=self.linear.bias.device, 
-                                                    dtype=self.linear.bias.dtype))
-            if self.linear.bias.device.type != 'meta':
-                sharded_bias.data.copy_(self.linear.bias.data[start_idx:end_idx])
-            self.linear.bias = sharded_bias
+        self.local_out_features = out_features // self.tp_world_size
+        super().__init__(in_features, self.local_out_features, bias=bias, device=device, dtype=dtype)
+    
+    def copy(self, unsharded_mod: nn.Linear):
+        start_idx = self.tp_rank * self.local_out_features
+        end_idx = start_idx + self.local_out_features
+        self.weight.data.copy_(unsharded_mod.weight.data[start_idx:end_idx])
+        if self.bias is not None:
+            self.bias.data.copy_(unsharded_mod.bias.data[start_idx:end_idx])
 
     def forward(self, x: torch.Tensor):
         if x._backward_hooks is None:
             x.register_hook(lambda grad: dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=self.tp_group))
 
-        local_output = self.linear(x)
+        local_output = super().forward(x)
 
         if self.gather_output:
             out = DifferentiableAllGather.apply(local_output, self.tp_group)
@@ -94,76 +78,51 @@ class ColParallelLinear(nn.Module):
         return out
 
 
-class RowParallelLinear(nn.Module):
-    def __init__(self, linear, reduce_output, tp_group):
-        super().__init__()
-        self.linear = linear
+class RowParallelLinear(nn.Linear):
+    def __init__(self, in_features, out_features, bias, device, dtype, reduce_output, tp_group):
         self.tp_group = tp_group
-        self.reduce_output = reduce_output
         self.tp_world_size = dist.get_world_size(tp_group)
         self.tp_rank = dist.get_rank(tp_group)
+        self.reduce_output = reduce_output
 
-        local_in_features = self.linear.in_features // self.tp_world_size
-        out_features = self.linear.out_features
+        self.local_in_features = in_features // self.tp_world_size
+        super().__init__(self.local_in_features, out_features, bias=bias, device=device, dtype=dtype)
 
-        sharded_weight = nn.Parameter(torch.empty(out_features, 
-                                                  local_in_features, 
-                                                  device=self.linear.weight.device, 
-                                                  dtype=self.linear.weight.dtype
-                                                  ))
-
-        start_idx = self.tp_rank * local_in_features
-        end_idx = start_idx + local_in_features
-
-        if self.linear.weight.device.type != 'meta':
-            sharded_weight.data.copy_(self.linear.weight.data[:, start_idx:end_idx])
-        self.linear.weight = sharded_weight
-
-        if self.linear.bias is not None:
-            sharded_bias = nn.Parameter(torch.empty(out_features, 
-                                                    device=self.linear.bias.device, 
-                                                    dtype=self.linear.bias.dtype))
-            if self.linear.bias.device.type != 'meta':
-                sharded_bias.data.copy_(self.linear.bias.data)
-            self.linear.bias = sharded_bias
+    def copy(self, unsharded_mod: nn.Linear):
+        start_idx = self.tp_rank * self.local_in_features
+        end_idx = start_idx + self.local_in_features
+        self.weight.data.copy_(unsharded_mod.weight.data[:, start_idx:end_idx])
+        if self.bias is not None:
+            self.bias.data.copy_(unsharded_mod.bias.data)
 
     def forward(self, x: torch.Tensor):
-        local_output = self.linear(x)
+        local_output = super().forward(x)
 
         if self.reduce_output:
             local_output = DifferentiableAllReduce.apply(local_output, 'sum', self.tp_group)
 
         return local_output
 
-class VocabParallelEmbedding(nn.Module):
-    def __init__(self, embedding, tp_group):
-        super().__init__()
-        self.embedding = embedding
+class VocabParallelEmbedding(nn.Embedding):
+    def __init__(self, num_embeddings, embedding_dim, padding_idx, device, dtype, tp_group):
         self.tp_group = tp_group
         self.tp_world_size = dist.get_world_size(tp_group)
         self.tp_rank = dist.get_rank(tp_group)
 
-        self.local_num_embeddings = embedding.num_embeddings // self.tp_world_size
+        self.local_num_embeddings = num_embeddings // self.tp_world_size
+        super().__init__(self.local_num_embeddings, embedding_dim, padding_idx=padding_idx, device=device, dtype=dtype)
+        
         self.vocab_start_idx = self.tp_rank * self.local_num_embeddings
         self.vocab_end_idx = self.vocab_start_idx + self.local_num_embeddings
 
-        embedding_dim = embedding.embedding_dim
+    def copy(self, unsharded_mod: nn.Embedding):
+        self.weight.data.copy_(unsharded_mod.weight.data[self.vocab_start_idx:self.vocab_end_idx])
 
-        sharded_weight = nn.Parameter(torch.empty(self.local_num_embeddings, 
-                                                  embedding_dim,
-                                                  device=embedding.weight.device,
-                                                  dtype=embedding.weight.dtype))
-        
-        if self.embedding.weight.device.type != 'meta':
-            sharded_weight.data.copy_(self.embedding.weight.data[self.vocab_start_idx:self.vocab_end_idx])
-        self.embedding.weight = sharded_weight
-
-        
     def forward(self, input_ids):
         local_mask = (input_ids >= self.vocab_start_idx) & (input_ids < self.vocab_end_idx)    
         local_ids = input_ids - self.vocab_start_idx
         clamped_local_ids = torch.clamp(local_ids, 0, self.local_num_embeddings - 1)
-        local_output = self.embedding(clamped_local_ids)
+        local_output = super().forward(clamped_local_ids)
         local_output = local_output * local_mask.float().unsqueeze(-1)
         
         local_output = DifferentiableAllReduce.apply(local_output, 'sum', self.tp_group)
@@ -237,18 +196,44 @@ def apply_tensor_parallelism(model: nn.Module,
             for key, shard_info in sharding_map.items():
                 if module_name.endswith(key):
                     if shard_info['type'] == 'row':
-                        new_child = RowParallelLinear(module, shard_info.get('reduce_output', False), tp_group)
+                        sharded_module = RowParallelLinear(
+                            in_features=module.in_features,
+                            out_features=module.out_features,
+                            bias=(module.bias is not None),
+                            device=module.weight.device,
+                            dtype=module.weight.dtype,
+                            tp_group=tp_group,
+                            reduce_output=shard_info.get("reduce_output", False),
+                        )
                     elif shard_info['type'] == 'col':
-                        new_child = ColParallelLinear(module, shard_info.get('gather_output', False), tp_group)
+                        sharded_module = ColParallelLinear(
+                            in_features=module.in_features,
+                            out_features=module.out_features,
+                            bias=(module.bias is not None),
+                            device=module.weight.device,
+                            dtype=module.weight.dtype,
+                            tp_group=tp_group,
+                            gather_output=shard_info.get("gather_output", False),
+                        )
                     elif shard_info['type'] == 'vocab':
-                        new_child = VocabParallelEmbedding(module, tp_group)
+                        sharded_module = VocabParallelEmbedding(
+                            num_embeddings=module.num_embeddings,
+                            embedding_dim=module.embedding_dim,
+                            padding_idx=module.padding_idx,
+                            device=module.weight.device,
+                            dtype=module.weight.dtype,
+                            tp_group=tp_group,
+                        )
                     else:
                         raise ValueError(f"Invalid shard type {shard_info['type']}")
-                    
+
+                    if module.weight.device.type != "meta":
+                        sharded_module.copy(module)
+
                     *parent_path, leaf = module_name.split('.')
                     parent_module = reduce(getattr, parent_path, model)
-                    setattr(parent_module, leaf, new_child)
+                    setattr(parent_module, leaf, sharded_module)
                     break
 
     if config.tie_word_embeddings:
-        model.transformer.wte.embedding.weight = model.lm_head.linear.weight
+        model.transformer.wte.weight = model.lm_head.weight
