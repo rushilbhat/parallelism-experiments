@@ -153,21 +153,31 @@ class CustomFSDP(torch.nn.Module):
         self.flat_param = torch.zeros(padded_size, device='cuda')
         self.local_shard = torch.zeros(shard_size, device='cuda')
         self.local_shard.grad = torch.zeros_like(self.local_shard)
-        self._materialize_params()
-        self._update_module_params(flag=True)
 
-        def _apply_param_init_fn(root_module, param_init_fn):
-            queue = deque([root_module])
-            while queue:
-                module = queue.popleft()
-                if not isinstance(module, CustomFSDP):
-                    param_init_fn(module)
-                for child in module.children():
-                    if not isinstance(child, CustomFSDP):
-                        queue.append(child)
+        devices = {p.device for n, p in self.module.named_parameters() if '_fsdp_wrapped_module' not in n}
+        assert len(devices) == 1, "All parameters must be on the same device"
+        
+        if devices.pop() != torch.device('meta'):
+            offset = 0
+            for name, numel in zip(self.param_names, self.param_numels):
+                self.flat_param[offset:offset+numel] = self.module.get_parameter(name).data.view(-1)
+                offset += numel
+        else:
+            self._materialize_params()
+            self._update_module_params(flag=True)
 
- 
-        _apply_param_init_fn(self.module, param_init_fn)
+            def _apply_param_init_fn(root_module, param_init_fn):
+                queue = deque([root_module])
+                while queue:
+                    module = queue.popleft()
+                    if not isinstance(module, CustomFSDP):
+                        param_init_fn(module)
+                    for child in module.children():
+                        if not isinstance(child, CustomFSDP):
+                            queue.append(child)
+
+    
+            _apply_param_init_fn(self.module, param_init_fn)
 
         start_idx = self.rank * shard_size
         end_idx = start_idx + shard_size
@@ -223,7 +233,7 @@ class CustomFSDP(torch.nn.Module):
         self.flat_param.data = full_tensor
 
         if include_grads:
-            full_grads_tensor = torch.zeros(self.local_shard.grad.numel() * self.world_size, device=self.local_shard.grad.device)
+            full_grads_tensor = torch.zeros_like(self.flat_param)
             self.flat_param.grad = full_grads_tensor
 
         self._update_module_params(include_grads=include_grads)
