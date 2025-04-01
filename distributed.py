@@ -156,14 +156,14 @@ class CustomFSDP(torch.nn.Module):
 
         devices = {p.device for n, p in self.module.named_parameters() if '_fsdp_wrapped_module' not in n}
         assert len(devices) == 1, "All parameters must be on the same device"
-        
-        if devices.pop() != torch.device('meta'):
+        is_materialised = (devices.pop() != torch.device('meta'))
+        if is_materialised:
             offset = 0
             for name, numel in zip(self.param_names, self.param_numels):
                 self.flat_param[offset:offset+numel] = self.module.get_parameter(name).data.view(-1)
                 offset += numel
         else:
-            self._materialize_params()
+            self._materialise_params()
             self._update_module_params(flag=True)
 
             def _apply_param_init_fn(root_module, param_init_fn):
@@ -184,7 +184,7 @@ class CustomFSDP(torch.nn.Module):
         self.local_shard.data.add_(self.flat_param[start_idx: end_idx])
         self._shard()
 
-    def _materialize_params(self):
+    def _materialise_params(self):
         def _replace_param(param_path, new_param):
             *module_path, leaf = param_path.split('.')   
             submodule = reduce(getattr, module_path, self.module)
@@ -192,9 +192,6 @@ class CustomFSDP(torch.nn.Module):
 
         for name in self.param_names:
             _replace_param(name, nn.Parameter(torch.empty(0, device='cuda')))
-
-        if hasattr(self.module, 'config') and self.module.config.tie_word_embeddings:
-            self.module.lm_head.weight = self.module.transformer.wte.weight
             
     def _update_module_params(self, include_grads=False, flag=False):
         is_sharded = self.flat_param.data_ptr() == self.local_shard.data_ptr()

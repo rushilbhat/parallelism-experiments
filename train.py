@@ -129,48 +129,46 @@ def get_param_dims(model):
         param_dims[name] = param.dim()
     return param_dims
 
-device_context = torch.device('meta' if is_distributed and args.deferred_init else 'cpu')
+device_context = torch.device('meta') if is_distributed and args.deferred_init else torch.device(device)
 with device_context:
     model = GPT(GPTConfig(vocab_size=50304))
 param_dims = get_param_dims(model)
 
-if is_distributed:
-    if tp_size > 1:
-        apply_tensor_parallelism(model, 
-                                 tp_group,
-                                 enable_loss_parallelism=args.enable_loss_parallelism)
+if tp_size > 1:
+    apply_tensor_parallelism(model, 
+                                tp_group,
+                                enable_loss_parallelism=args.enable_loss_parallelism)
+    
+    if device_context.type == 'meta' and not (dp_size > 1 and args.data_parallel_type == 'fsdp'):
+        def init_weights(module):
+            module.to_empty(device=torch.device(f'cuda:{distributed_local_rank}'), recurse=False)
+            model._init_weights(module)
+
+        model.apply(init_weights)
         
-        if device_context.type == 'cpu':
-            model.to(device)
+if dp_size > 1:
+    if args.data_parallel_type == "fsdp":
+        if args.implementation == "custom":
+            model = CustomFSDP(model, process_group=dp_group, param_init_fn=model._init_weights)
+        else: # pytorch
+            def init_weights(module):
+                module.to_empty(device=torch.device(f'cuda:{distributed_local_rank}'), recurse=False)
+                model._init_weights(module)
+                
+            gpt2_auto_wrap_policy = functools.partial(
+                transformer_auto_wrap_policy,
+                transformer_layer_cls={
+                    Block,
+                },
+            )
+            model = FSDP(model, process_group=dp_group, auto_wrap_policy=gpt2_auto_wrap_policy, use_orig_params=True, param_init_fn=init_weights)
+    elif args.data_parallel_type == "ddp":
+        if args.implementation == "custom":
+            model = CustomDDP(model.to(device), dp_group)
+        else: # pytorch
+            model = DDP(model.to(device), device_ids=[dist.get_rank(dp_group)])
 
-    if dp_size > 1:
-        if args.data_parallel_type == "fsdp":
-            if args.implementation == "custom":
-                model = CustomFSDP(model, process_group=dp_group, param_init_fn=model._init_weights)
-            else: # pytorch
-                def init_weights(module):
-                    module.to_empty(device=torch.device(f'cuda:{distributed_local_rank}'), recurse=False)
-                    model._init_weights(module)
-                    
-                    if module == model.lm_head and model.config.tie_word_embeddings:
-                        model.transformer.wte.weight = module.weight
-
-                gpt2_auto_wrap_policy = functools.partial(
-                    transformer_auto_wrap_policy,
-                    transformer_layer_cls={
-                        Block,
-                    },
-                )
-                model = FSDP(model, process_group=dp_group, auto_wrap_policy=gpt2_auto_wrap_policy, use_orig_params=True, param_init_fn=init_weights)
-        elif args.data_parallel_type == "ddp":
-            if args.implementation == "custom":
-                model = CustomDDP(model.to(device), dp_group)
-            else: # pytorch
-                model = DDP(model.to(device), device_ids=[dist.get_rank(dp_group)])
-
-        if master_process: print(f"using {args.data_parallel_type} implementation: {args.implementation}")
-else:
-    model = model.to(device)
+    if master_process: print(f"using {args.data_parallel_type} implementation: {args.implementation}")
 
 raw_model = model.module if dp_size > 1 else model # always contains the "raw" unwrapped model
 

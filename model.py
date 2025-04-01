@@ -96,7 +96,7 @@ class GPT(nn.Module):
 
         # weight sharing scheme
         if config.tie_word_embeddings:
-            self.transformer.wte.weight = self.lm_head.weight
+            self.transformer.wte._parameters = self.lm_head._parameters
 
         # init params
         self.apply(self._init_weights)

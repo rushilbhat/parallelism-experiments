@@ -217,4 +217,4 @@ def apply_tensor_parallelism(model: nn.Module,
                     break
 
     if config.tie_word_embeddings:
-        model.transformer.wte.weight = model.lm_head.weight
+        model.transformer.wte._parameters = model.lm_head._parameters
