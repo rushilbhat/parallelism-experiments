@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.distributed as dist
 from functools import reduce
 
@@ -57,7 +58,7 @@ class ColParallelLinear(nn.Linear):
         if x._backward_hooks is None:
             x.register_hook(lambda grad: dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=self.tp_group))
 
-        local_output = super().forward(x)
+        local_output = F.linear(x, self.weight, self.bias)
 
         if self.gather_output:
             out = DifferentiableAllGather.apply(local_output, self.tp_group)
@@ -85,10 +86,13 @@ class RowParallelLinear(nn.Linear):
             self.bias.data.copy_(unsharded_mod.bias.data)
 
     def forward(self, x: torch.Tensor):
-        local_output = super().forward(x)
+        local_output = F.linear(x, self.weight)
 
         if self.reduce_output:
             local_output = DifferentiableAllReduce.apply(local_output, 'sum', self.tp_group)
+
+        if self.bias is not None:
+            local_output = local_output + self.bias
 
         return local_output
 
