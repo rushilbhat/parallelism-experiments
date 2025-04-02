@@ -12,74 +12,77 @@ class Bucket:
     def __init__(self):
         self.parameters = {}
         self.size = 0 #in bytes
-        self.grad_count = 0
+        self.pending_parameters = set()
 
     def add_param(self, named_param):
         name, param = named_param
         self.parameters[name] = param
         self.size += param.numel() * param.element_size()
+        self.pending_parameters.add(param)
+
+    def reset(self):
+        self.pending_parameters = set(self.parameters.values())
 
 class Reducer:
-    def __init__(self, named_params, bucket_cap_mb, world_size):
-        self.named_params = reversed(list(named_params))
+    def __init__(self, named_params, process_group, bucket_cap_mb):
+        self.process_group = process_group
         self.bucket_cap_mb = bucket_cap_mb
-        self.world_size = world_size
+        self.world_size = dist.get_world_size(self.process_group)
         self.buckets = []
         self.futures = []
-        self._create_buckets()
+        self._create_buckets(reversed(list(named_params)))
         self._register_hooks()
         self.require_backward_grad_sync = True
-        self.reduced_buckets_count = 0
 
-    def _create_buckets(self):
+    def _create_buckets(self, named_params):
         current_bucket = Bucket()
-        for name, param in self.named_params:
-            if param.requires_grad:
-                param_size = param.numel() * param.element_size() #using param_size as proxy for size of param.grad
-                if current_bucket.size + param_size > self.bucket_cap_mb * 1024 * 1024:
-                    self.buckets.append(current_bucket)
-                    current_bucket = Bucket()
-                current_bucket.add_param((name,param))
+        for name, param in named_params:
+            if not param.requires_grad:
+                continue
+            param_size = param.numel() * param.element_size() #using param_size as proxy for size of param.grad
+            if current_bucket.size + param_size > self.bucket_cap_mb * 1024 * 1024:
+                self.buckets.append(current_bucket)
+                current_bucket = Bucket()
+            current_bucket.add_param((name,param))
         self.buckets.append(current_bucket)
 
     def _register_hooks(self):
-        # Add hooks to trigger gradient reduction when all grads in bucket are ready
         for bucket in self.buckets:
-            for param in bucket.parameters.values():
-                def hook(p, b=bucket):
-                    if self.require_backward_grad_sync:
-                        b.grad_count += 1
-                        if b.grad_count == len(b.parameters):
-                            self._reduce_bucket(b)
-                            if self.reduced_buckets_count == len(self.buckets):
-                                self.finalize_backward()
-
-                param.register_post_accumulate_grad_hook(hook)
+            for _, param in bucket.parameters.items():
+                param.register_post_accumulate_grad_hook(lambda p, b=bucket: self._on_grad_ready(p, b))
+    
+    def _on_grad_ready(self, p, b):
+        if not self.require_backward_grad_sync:
+            return
+        b.pending_parameters.remove(p)
+        if not b.pending_parameters:
+            self._reduce_bucket(b)
 
     def _reduce_bucket(self, bucket):
-        flat_grads = torch.cat([param.grad.flatten() for param in bucket.parameters.values()])
+        flat_grads = torch.cat([param.grad.flatten() for _, param in bucket.parameters.items()])
         future = dist.all_reduce(flat_grads, group=self.process_group, async_op=True)
         self.futures.append((future, bucket))
-        self.reduced_buckets_count += 1
+        if len(self.futures) == len(self.buckets):
+            self.finalize_backward()
 
     def finalize_backward(self):
         #Wait for all async reductions and update gradients
         for future, bucket in self.futures:
             future.wait()
-            flat_grads = future.result()
-            flat_grads[0].div_(self.world_size)
+            flat_grads = future.result()[0]
+            flat_grads.div_(self.world_size)
             self._unflatten_and_copy(flat_grads, bucket)
 
         self.futures.clear()
-        self.reduced_buckets_count = 0
+        for bucket in self.buckets:
+            bucket.reset()
 
     def _unflatten_and_copy(self, flat_grads, bucket):
         offset = 0
-        for name, param in bucket.parameters.items():
+        for _, param in bucket.parameters.items():
             numel = param.grad.numel()
-            param.grad = flat_grads[0][offset:offset+numel].view_as(param)
+            param.grad = flat_grads[offset:offset+numel].view_as(param)
             offset += numel
-        bucket.grad_count = 0
 
     
     def _measure_gpu_memory(self, stage):
@@ -96,9 +99,8 @@ class CustomDDP(nn.Module):
         super().__init__()
         self.process_group = process_group
         self.world_size = dist.get_world_size(self.process_group)
-
         self.module = module
-        self.reducer = Reducer(self.module.named_parameters(), bucket_cap_mb, self.world_size)
+        self.reducer = Reducer(self.module.named_parameters(), process_group, bucket_cap_mb)
 
     def set_require_backward_grad_sync(self, require_sync):
         self.reducer.require_backward_grad_sync = require_sync
