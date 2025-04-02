@@ -97,13 +97,13 @@ class RowParallelLinear(nn.Linear):
         return local_output
 
 class VocabParallelEmbedding(nn.Embedding):
-    def __init__(self, num_embeddings, embedding_dim, padding_idx, device, dtype, tp_group):
+    def __init__(self, num_embeddings, embedding_dim, device, dtype, tp_group):
         self.tp_group = tp_group
         self.tp_world_size = dist.get_world_size(tp_group)
         self.tp_rank = dist.get_rank(tp_group)
 
         self.local_num_embeddings = num_embeddings // self.tp_world_size
-        super().__init__(self.local_num_embeddings, embedding_dim, padding_idx=padding_idx, device=device, dtype=dtype)
+        super().__init__(self.local_num_embeddings, embedding_dim, device=device, dtype=dtype)
         
         self.vocab_start_idx = self.tp_rank * self.local_num_embeddings
         self.vocab_end_idx = self.vocab_start_idx + self.local_num_embeddings
@@ -137,8 +137,7 @@ def vocab_parallel_cross_entropy_loss(logits, targets, tp_group, ignore_index=-1
     global_sum = DifferentiableAllReduce.apply(local_sum, 'sum', tp_group)
     logsumexp = torch.log(global_sum)
 
-    ignore_mask = (targets != ignore_index)
-    local_mask = (targets >= vocab_start_idx) & (targets < vocab_end_idx) & ignore_mask
+    local_mask = (targets >= vocab_start_idx) & (targets < vocab_end_idx) #& ignore_mask
 
     local_targets = targets - vocab_start_idx
     local_targets = local_targets.clamp(0, local_vocab_size - 1)
@@ -148,9 +147,7 @@ def vocab_parallel_cross_entropy_loss(logits, targets, tp_group, ignore_index=-1
     pred_logits = DifferentiableAllReduce.apply(pred_logits, 'sum', tp_group)
     pred_logprobs = logsumexp - pred_logits
     
-    nll_loss = pred_logprobs.sum()
-    valid_count = ignore_mask.float().sum()
-    avg_nll_loss = nll_loss / valid_count
+    avg_nll_loss = pred_logprobs.mean()
 
     return avg_nll_loss
 
@@ -204,7 +201,6 @@ def apply_tensor_parallelism(model: nn.Module,
                         sharded_module = VocabParallelEmbedding(
                             num_embeddings=module.num_embeddings,
                             embedding_dim=module.embedding_dim,
-                            padding_idx=module.padding_idx,
                             device=module.weight.device,
                             dtype=module.weight.dtype,
                             tp_group=tp_group,
