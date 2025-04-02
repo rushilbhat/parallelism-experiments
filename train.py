@@ -205,7 +205,7 @@ for step in range(max_steps):
     last_step = (step == max_steps - 1)
 
     model.train()
-    optimizer.zero_grad(set_to_none=not(dp_size > 1 and args.data_parallel_type == "fsdp" and args.implementation == "custom"))
+    optimizer.zero_grad()
     loss_accum = 0.0
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()

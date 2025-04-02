@@ -154,7 +154,7 @@ class CustomFSDP(torch.nn.Module):
         self.local_shard = torch.zeros(shard_size, device='cuda')
         self.local_shard.grad = torch.zeros_like(self.local_shard)
 
-        devices = {p.device for n, p in self.module.named_parameters() if '_fsdp_wrapped_module' not in n}
+        devices = {self.module.get_parameter(name).device for name in self.param_names}
         assert len(devices) == 1, "All parameters must be on the same device"
         is_materialised = (devices.pop() != torch.device('meta'))
         if is_materialised:
@@ -248,6 +248,8 @@ class CustomFSDP(torch.nn.Module):
             param.register_post_accumulate_grad_hook(lambda p: self._post_backward())
 
     def _pre_backward(self):
+        if all(self._fsdp_wrapped_module.get_parameter(name).grad is None for name in self.param_names):
+            self.local_shard.grad = torch.zeros_like(self.local_shard)
         self.grad_counter = 0
         self._gather(include_grads=True)
         
