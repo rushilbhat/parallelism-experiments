@@ -24,8 +24,10 @@ from contextlib import nullcontext
 
 from model import GPT, GPTConfig, Block
 from data_loader import DataLoaderLite
-from distributed import CustomDDP, CustomFSDP, clip_grad_norm
-from tensor_parallel import apply_tensor_parallelism, vocab_parallel_cross_entropy_loss
+from parallel.ddp import CustomDDP
+from parallel.fsdp import CustomFSDP
+from parallel.utils import clip_grad_norm
+from parallel.tensor_parallel import apply_tensor_parallelism, vocab_parallel_cross_entropy_loss
 
 torch.use_deterministic_algorithms(True)
 

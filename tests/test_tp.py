@@ -6,9 +6,10 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-from tensor_parallel import ColParallelLinear, RowParallelLinear, VocabParallelEmbedding, apply_tensor_parallelism, DifferentiableAllGather, DifferentiableAllReduce, vocab_parallel_cross_entropy_loss
-from model import GPTConfig, GPT
-from test_distributed_base import BaseDistributedTest
+from parallel.tensor_parallel import ColParallelLinear, RowParallelLinear, VocabParallelEmbedding, apply_tensor_parallelism, vocab_parallel_cross_entropy_loss, DifferentiableAllGather, DifferentiableAllReduce
+
+from tests.test_distributed_base import BaseDistributedTest
+
 torch.use_deterministic_algorithms(True)
 
 class TestTP(BaseDistributedTest):

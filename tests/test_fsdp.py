@@ -9,9 +9,9 @@ import functools
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-from distributed import CustomFSDP
+from parallel.fsdp import CustomFSDP
 from model import GPT, GPTConfig, Block
-from test_distributed_base import BaseDistributedTest
+from tests.test_distributed_base import BaseDistributedTest
 
 torch.use_deterministic_algorithms(True)
 

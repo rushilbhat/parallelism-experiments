@@ -36,7 +36,6 @@ class DifferentiableAllReduce(torch.autograd.Function):
         if ctx.op == 'sum':
             return grad_output, None, None
 
-
 class ColParallelLinear(nn.Linear):
     def __init__(self, in_features, out_features, bias, device, dtype, gather_output, tp_group):
         self.tp_group = tp_group

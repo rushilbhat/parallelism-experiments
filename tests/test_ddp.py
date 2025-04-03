@@ -7,10 +7,10 @@ import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 from unittest.mock import patch
-from distributed import CustomDDP, Reducer
+from parallel.ddp import CustomDDP
 from model import GPT, GPTConfig
 from contextlib import nullcontext
-from test_distributed_base import BaseDistributedTest
+from tests.test_distributed_base import BaseDistributedTest
 
 torch.use_deterministic_algorithms(True)
 
