@@ -39,12 +39,12 @@ class Reducer:
         for name, param in named_params:
             if not param.requires_grad:
                 continue
-            param_size = param.numel() * param.element_size() #using param_size as proxy for size of param.grad
-            if current_bucket.size + param_size > self.bucket_cap_mb * 1024 * 1024:
+            current_bucket.add_param((name,param))
+            if current_bucket.size > self.bucket_cap_mb * 1024 * 1024:
                 self.buckets.append(current_bucket)
                 current_bucket = Bucket()
-            current_bucket.add_param((name,param))
-        self.buckets.append(current_bucket)
+        if current_bucket.size > 0:
+            self.buckets.append(current_bucket)
 
     def _register_hooks(self):
         for bucket in self.buckets:
@@ -60,7 +60,7 @@ class Reducer:
 
     def _reduce_bucket(self, bucket):
         flat_grads = torch.cat([param.grad.flatten() for _, param in bucket.parameters.items()])
-        future = dist.all_reduce(flat_grads, group=self.process_group, async_op=True)
+        future = dist.all_reduce(flat_grads, group=self.process_group, op=dist.ReduceOp.AVG, async_op=True)
         self.futures.append((future, bucket))
         if len(self.futures) == len(self.buckets):
             self.finalize_backward()
@@ -70,7 +70,6 @@ class Reducer:
         for future, bucket in self.futures:
             future.wait()
             flat_grads = future.result()[0]
-            flat_grads.div_(self.world_size)
             self._unflatten_and_copy(flat_grads, bucket)
 
         self.futures.clear()
