@@ -8,6 +8,8 @@ import torch
 import torch.nn.functional as F
 import argparse
 import functools
+import matplotlib.pyplot as plt
+import numpy as np
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
@@ -16,7 +18,6 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from contextlib import nullcontext
 
 from model import GPT, GPTConfig, Block
-from data_loader import DataLoaderLite
 from parallel.ddp import CustomDDP
 from parallel.fsdp import CustomFSDP
 from parallel.utils import clip_grad_norm
@@ -43,6 +44,8 @@ def parse_args(is_distributed):
         parser.add_argument('--deferred_init', action=argparse.BooleanOptionalAction, 
                             help="Delay materialisation of model parameters until sharding is applied")        
     parser.add_argument('--gradient_clipping', action=argparse.BooleanOptionalAction)
+    parser.add_argument('--eval_interval', type=int, default=10, 
+                        help='Interval between evaluations on validation set')
     return parser.parse_args()
 
 
@@ -64,11 +67,11 @@ class Trainer:
         self.T = 1024   # sequence length
         self._compute_grad_accum_steps()
 
-        self.train_loader = DataLoaderLite(B=self.B,
-                                           T=self.T,
-                                           process_rank=self.dp_rank,
-                                           num_processes=self.dp_size,
-                                           master_process=self.master_process)
+        self.data_dir = 'data/'
+        self.eval_interval = self.args.eval_interval
+        self.eval_steps = []
+        self.eval_losses = []
+        self.train_losses = []
         
         self.model, self.param_dims = self._build_model()
 
@@ -248,6 +251,69 @@ class Trainer:
         coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
         return self.min_lr + coeff * (self.max_lr - self.min_lr)
 
+    def get_batch(self, split):
+        if split == 'train':
+            data = np.memmap(os.path.join(self.data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+        else:
+            data = np.memmap(os.path.join(self.data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+        ix = torch.randint(len(data) - self.T, (self.B,))
+        x = torch.stack([torch.from_numpy((data[i:i+self.T]).astype(np.int64)) for i in ix])
+        y = torch.stack([torch.from_numpy((data[i+1:i+1+self.T]).astype(np.int64)) for i in ix])
+        if self.device_type == 'cuda':
+            x, y = x.pin_memory().to(self.device, non_blocking=True), y.pin_memory().to(self.device, non_blocking=True)
+        else:
+            x, y = x.to(self.device), y.to(self.device)
+        return x, y
+
+    def evaluate(self):
+        self.model.eval()
+        eval_iters = 10 
+        losses = torch.zeros(eval_iters, device=self.device)
+        
+        with torch.no_grad():
+            for k in range(eval_iters):
+                x, y = self.get_batch('val')
+                with torch.autocast(device_type=self.device_type, 
+                                    dtype=torch.bfloat16 if self.HAS_BF16 else torch.float16):
+                    logits = self.model(x)
+                    if self.tp_size > 1 and self.args.enable_loss_parallelism:
+                        loss = vocab_parallel_cross_entropy_loss(logits, y, self.tp_group)
+                    else:
+                        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+                    losses[k] = loss.item()
+        
+        # Average the loss
+        val_loss = losses.mean()
+        
+        # Average across distributed processes if using DP
+        if self.dp_size > 1:
+            # val_loss_tensor = torch.tensor([val_loss], device=self.device)
+            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG, group=self.dp_group)
+            # val_loss = val_loss_tensor.item()
+            
+        self.model.train()
+        return val_loss
+
+    def plot_loss(self):
+        if not self.master_process:
+            return
+
+        os.makedirs('logs', exist_ok=True)
+            
+        plt.figure(figsize=(10, 6))
+        plt.plot(self.eval_steps, self.eval_losses, 'o-', label='Validation Loss')
+        plt.plot(range(self.max_steps), self.train_losses, 'o-', label='Training Loss')
+        plt.xlabel('Training Step')
+        plt.ylabel('Loss')
+        plt.title('Validation Loss vs. Training Steps')
+        plt.grid(True)
+        plt.legend()
+        
+        # Save the plot
+        plt.savefig(os.path.join('logs', 'validation_loss.png'))
+        if self.master_process:
+            print(f"Validation loss plot saved to validation_loss.png")
+
     def train(self):
         """Main training loop."""
         torch.set_float32_matmul_precision('high')
@@ -257,9 +323,15 @@ class Trainer:
             self.optimizer.zero_grad()
             loss_accum = 0.0
 
+            if step % self.eval_interval == 0:
+                val_loss = self.evaluate()
+                self.eval_steps.append(step)
+                self.eval_losses.append(val_loss.item())
+                if self.master_process:
+                    print(f"EVAL {step:5d} | val loss: {val_loss:.6f}")
+
             for micro_step in range(self.grad_accum_steps):
-                x, y = self.train_loader.next_batch()
-                x, y = x.to(self.device), y.to(self.device)
+                x, y = self.get_batch('train')
                 grad_sync_context = self._no_sync_context(micro_step)
 
                 with grad_sync_context:
@@ -298,12 +370,7 @@ class Trainer:
             if self.device_type == "cuda":
                 torch.cuda.synchronize()
             dt = time.time() - t0
-            tokens_processed = (
-                self.train_loader.B 
-                * self.train_loader.T 
-                * self.grad_accum_steps 
-                * self.distributed_world_size
-            )
+            tokens_processed = self.B * self.T * self.grad_accum_steps * self.distributed_world_size
             tokens_per_sec = tokens_processed / dt
 
             if self.master_process:
@@ -313,6 +380,9 @@ class Trainer:
                     f"norm: {f'{norm:.4f}' if self.args.gradient_clipping else None} | "
                     f"dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}"
                 )
+                self.train_losses.append(loss_accum.item())
+
+        self.plot_loss()
 
         # Cleanup
         if self.is_distributed:

@@ -54,7 +54,7 @@ class ColParallelLinear(nn.Linear):
             self.bias.data.copy_(unsharded_mod.bias.data[start_idx:end_idx])
 
     def forward(self, x: torch.Tensor):
-        if x._backward_hooks is None:
+        if x._backward_hooks is None and x.requires_grad:
             x.register_hook(lambda grad: dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=self.tp_group))
 
         local_output = F.linear(x, self.weight, self.bias)
