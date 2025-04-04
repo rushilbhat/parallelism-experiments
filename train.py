@@ -1,11 +1,4 @@
 # train.py
-
-# simple launch:
-# python train_gpt2.py
-# DDP launch for e.g. 8 GPUs:
-# torchrun --standalone --nproc_per_node=8 train_gpt2.py
-
-# run the training loop
 import os
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
@@ -27,7 +20,10 @@ from data_loader import DataLoaderLite
 from parallel.ddp import CustomDDP
 from parallel.fsdp import CustomFSDP
 from parallel.utils import clip_grad_norm
-from parallel.tensor_parallel import apply_tensor_parallelism, vocab_parallel_cross_entropy_loss
+from parallel.tensor_parallel import (
+    apply_tensor_parallelism, 
+    vocab_parallel_cross_entropy_loss
+)
 
 torch.use_deterministic_algorithms(True)
 
@@ -50,215 +46,305 @@ def parse_args(is_distributed):
     return parser.parse_args()
 
 
-# torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
-is_distributed = int(os.environ.get('RANK', -1)) != -1 # is this a distributed run?
-if is_distributed:
-    # use of DDP atm demands CUDA, we set the device appropriately according to rank
-    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
-    init_process_group(backend='nccl')
-    distributed_rank = int(os.environ['RANK'])
-    distributed_local_rank = int(os.environ['LOCAL_RANK'])
-    distributed_world_size = int(os.environ['WORLD_SIZE'])
-    device = f'cuda:{distributed_local_rank}'
-    torch.cuda.set_device(device)
-    master_process = distributed_rank == 0 # this process will do logging, checkpointing etc.
-else:
-    # vanilla, non-distributed run
-    distributed_rank = 0
-    distributed_local_rank = 0
-    distributed_world_size = 1
-    master_process = True
-    # attempt to autodetect device
-    device = "cpu"
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = "mps"
-    print(f"using device: {device}")
+class Trainer:
+    def __init__(self):
+        self.is_distributed = int(os.environ.get('RANK', -1)) != -1
+        self.args = parse_args(self.is_distributed)
 
-# added after video, pytorch can be serious about it's device vs. device_type distinction
-device_type = "cuda" if device.startswith("cuda") else "cpu"
-
-args = parse_args(is_distributed)
-
-torch.manual_seed(1337)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(1337)
-
-HAS_BF16 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
-
-# Set up DP/TP if distributed
-if is_distributed:
-    dp_size = args.data_parallel_size
-    tp_size = args.tensor_parallel_size
-    assert dp_size * tp_size == distributed_world_size, "dp_size * tp_size must equal distributed_world_size"
-
-    tp_rank = distributed_rank % tp_size
-    dp_rank = distributed_rank // tp_size
-
-    tp_groups = [dist.new_group([tp + dp * tp_size for tp in range(tp_size)]) for dp in range(dp_size)]
-    dp_groups = [dist.new_group([dp * tp_size + tp for dp in range(dp_size)]) for tp in range(tp_size)]
-    tp_group = tp_groups[dp_rank]
-    dp_group = dp_groups[tp_rank]
-
-    if master_process:
-        print(f"Running with DP size={dp_size} and TP size={tp_size}")
-        print(f"This rank = {distributed_rank}, dp_rank={dp_rank}, tp_rank={tp_rank}")
-else:
-    dp_size = 1
-    tp_size = 1
-    dp_rank = 0
-    tp_rank = 0
-    tp_group = None
-    dp_group = None
-
-total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-B = 8 # micro batch size CHANGE
-T = 1024 # sequence length
-assert total_batch_size % (B * T * dp_size) == 0, "make sure total_batch_size is divisible by B * T * data parallel size"
-grad_accum_steps = total_batch_size // (B * T * dp_size)
-if master_process:
-    print(f"total desired batch size: {total_batch_size}")
-    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
-
-train_loader = DataLoaderLite(B=B, T=T, process_rank=dp_rank, num_processes=dp_size, master_process=master_process)
-
-torch.set_float32_matmul_precision('high')
-
-def get_param_dims(model):
-    param_dims = {}
-    for name, param in model.named_parameters():
-        param_dims[name] = param.dim()
-    return param_dims
-
-device_context = torch.device('meta') if is_distributed and args.deferred_init else torch.device(device)
-with device_context:
-    model = GPT(GPTConfig(vocab_size=50304))
-param_dims = get_param_dims(model)
-
-if tp_size > 1:
-    apply_tensor_parallelism(model, 
-                                tp_group,
-                                enable_loss_parallelism=args.enable_loss_parallelism)
-    
-    if device_context.type == 'meta' and not (dp_size > 1 and args.data_parallel_type == 'fsdp'):
-        def init_weights(module):
-            module.to_empty(device=torch.device(f'cuda:{distributed_local_rank}'), recurse=False)
-            model._init_weights(module)
-
-        model.apply(init_weights)
+        self._init_distributed()
         
-if dp_size > 1:
-    if args.data_parallel_type == "fsdp":
-        if args.implementation == "custom":
-            model = CustomFSDP(model, process_group=dp_group, param_init_fn=model._init_weights)
-        else: # pytorch
-            def init_weights(module):
-                module.to_empty(device=torch.device(f'cuda:{distributed_local_rank}'), recurse=False)
-                model._init_weights(module)
-                
+        self.device = self._select_device()
+        self.device_type = "cuda" if self.device.startswith("cuda") else "cpu"
+        torch.manual_seed(1337)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(1337)
+
+        self.total_batch_size = 524288  # in tokens
+        self.B = 8      # micro batch size
+        self.T = 1024   # sequence length
+        self._compute_grad_accum_steps()
+
+        self.train_loader = DataLoaderLite(B=self.B,
+                                           T=self.T,
+                                           process_rank=self.dp_rank,
+                                           num_processes=self.dp_size,
+                                           master_process=self.master_process)
+        
+        self.model, self.param_dims = self._build_model()
+
+        # Mixed-precision / BF16
+        self.HAS_BF16 = torch.cuda.is_available() and (torch.cuda.get_device_capability()[0] >= 8)
+        self.scaler = torch.GradScaler(self.device_type, enabled=(not self.HAS_BF16))
+
+        # Create optimizer
+        self.optimizer = self.model.module.configure_optimizers(
+            weight_decay=0.1,
+            learning_rate=6e-4,
+            device_type=self.device_type,
+            param_dims=self.param_dims,
+            master_process=self.master_process,
+        ) if self.dp_size > 1 else self.model.configure_optimizers(
+            weight_decay=0.1,
+            learning_rate=6e-4,
+            device_type=self.device_type,
+            param_dims=self.param_dims,
+            master_process=self.master_process,
+        )
+
+        # Learning rate schedule
+        self.max_lr = 6e-4
+        self.min_lr = self.max_lr * 0.1
+        self.warmup_steps = 10
+        self.max_steps = 50
+
+    def _init_distributed(self):
+        if self.is_distributed:
+            init_process_group(backend='nccl')
+            self.distributed_rank = int(os.environ['RANK'])
+            self.distributed_local_rank = int(os.environ['LOCAL_RANK'])
+            self.distributed_world_size = int(os.environ['WORLD_SIZE'])
+            self.master_process = (self.distributed_rank == 0)
+        else:
+            self.distributed_rank = 0
+            self.distributed_local_rank = 0
+            self.distributed_world_size = 1
+            self.master_process = True
+
+        if self.is_distributed:
+            assert torch.cuda.is_available()
+            torch.cuda.set_device(f'cuda:{self.distributed_local_rank}')
+        
+        if self.is_distributed:
+            self.dp_size = self.args.data_parallel_size
+            self.tp_size = self.args.tensor_parallel_size
+            assert self.dp_size * self.tp_size == self.distributed_world_size, \
+                "dp_size * tp_size must match world_size"
+
+            self.tp_rank = self.distributed_rank % self.tp_size
+            self.dp_rank = self.distributed_rank // self.tp_size
+
+            self.tp_groups = [
+                dist.new_group([tp + dp * self.tp_size for tp in range(self.tp_size)]) 
+                for dp in range(self.dp_size)
+            ]
+            self.dp_groups = [
+                dist.new_group([dp * self.tp_size + tp for dp in range(self.dp_size)]) 
+                for tp in range(self.tp_size)
+            ]
+            self.tp_group = self.tp_groups[self.dp_rank]
+            self.dp_group = self.dp_groups[self.tp_rank]
+
+            if self.master_process:
+                print(f"Running with DP size={self.dp_size}, TP size={self.tp_size}")
+                print(f"This rank={self.distributed_rank}, dp_rank={self.dp_rank}, tp_rank={self.tp_rank}")
+        else:
+            self.dp_size = 1
+            self.tp_size = 1
+            self.dp_rank = 0
+            self.tp_rank = 0
+            self.tp_group = None
+            self.dp_group = None
+
+    def _select_device(self):
+        if self.is_distributed:
+            return f"cuda:{self.distributed_local_rank}"
+        else:
+            device = "cpu"
+            if torch.cuda.is_available():
+                device = "cuda"
+            if self.master_process:
+                print(f"Using device: {device}")
+            return device
+    
+    def _compute_grad_accum_steps(self):
+        self.grad_accum_steps = self.total_batch_size // (self.B * self.T * self.dp_size)
+        if self.master_process:
+            print(f"Total desired batch size: {self.total_batch_size}")
+            print(f"=> calculated gradient accumulation steps: {self.grad_accum_steps}")
+    
+    def _build_model(self):
+        """Build and wrap the GPT model with parallel strategies if needed."""
+        device_context = torch.device('meta') if self.is_distributed and self.args.deferred_init else torch.device(self.device)
+        with device_context:
+            model = GPT(GPTConfig(vocab_size=50304))
+
+        param_dims = self._get_param_dims(model)
+
+        # Tensor Parallel
+        if self.tp_size > 1:
+            apply_tensor_parallelism(
+                model,
+                self.tp_group,
+                enable_loss_parallelism=self.args.enable_loss_parallelism
+            )
+
+            # Need to initialise params if on a meta device and will not be wrapped in FSDP next.
+            if (device_context.type == 'meta' 
+                and not (self.dp_size > 1 and self.args.data_parallel_type == 'fsdp')):
+                def init_weights(module):
+                    module.to_empty(device=torch.device(f'cuda:{self.distributed_local_rank}'), recurse=False)
+                    model._init_weights(module)
+                model.apply(init_weights)
+
+        # Data Parallel
+        if self.dp_size > 1:
+            if self.args.data_parallel_type == "fsdp":
+                model = self.wrap_fsdp(model)
+            elif self.args.data_parallel_type == "ddp":
+                model = self._wrap_ddp(model)
+            
+            if self.master_process:
+                print(f"Using {self.args.data_parallel_type} implementation: {self.args.implementation}")
+        else:
+            model = model.to(self.device)
+
+        return model, param_dims
+
+    def wrap_fsdp(self, model):
+        """FSDP wrapping, either custom or PyTorch."""
+        if self.args.implementation == "custom":
+            return CustomFSDP(
+                model, 
+                process_group=self.dp_group, 
+                param_init_fn=model._init_weights
+            )
+        else:
             gpt2_auto_wrap_policy = functools.partial(
                 transformer_auto_wrap_policy,
-                transformer_layer_cls={
-                    Block,
-                },
+                transformer_layer_cls={Block},
             )
-            model = FSDP(model, process_group=dp_group, auto_wrap_policy=gpt2_auto_wrap_policy, use_orig_params=True, param_init_fn=init_weights)
-    elif args.data_parallel_type == "ddp":
-        if args.implementation == "custom":
-            model = CustomDDP(model.to(device), dp_group)
-        else: # pytorch
-            model = DDP(model.to(device), device_ids=[dist.get_rank(dp_group)])
+            def init_weights(module):
+                module.to_empty(device=torch.device(f'cuda:{self.distributed_local_rank}'), recurse=False)
+                model._init_weights(module)
+            return FSDP(
+                model, 
+                process_group=self.dp_group, 
+                auto_wrap_policy=gpt2_auto_wrap_policy, 
+                use_orig_params=True, 
+                param_init_fn=init_weights
+            )
 
-    if master_process: print(f"using {args.data_parallel_type} implementation: {args.implementation}")
-
-raw_model = model.module if dp_size > 1 else model # always contains the "raw" unwrapped model
-
-max_lr = 6e-4
-min_lr = max_lr * 0.1
-warmup_steps = 10
-max_steps = 50
-def get_lr(it):
-    # 1) linear warmup for warmup_iters steps
-    if it < warmup_steps:
-        return max_lr * (it+1) / warmup_steps
-    # 2) if it > lr_decay_iters, return min learning rate
-    if it > max_steps:
-        return min_lr
-    # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
-    return min_lr + coeff * (max_lr - min_lr)
-
-# optimize!
-scaler = torch.GradScaler(device_type, enabled=(not HAS_BF16))
-optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type, param_dims=param_dims, master_process=master_process)
-
-# create the log directory we will write checkpoints to and log to
-# log_dir = "log"
-# os.makedirs(log_dir, exist_ok=True)
-# log_file = os.path.join(log_dir, f"log.txt")
-# with open(log_file, "w") as f: # open for writing to clear the file
-#     pass
-
-for step in range(max_steps):
-    t0 = time.time()
-    last_step = (step == max_steps - 1)
-
-    model.train()
-    optimizer.zero_grad()
-    loss_accum = 0.0
-    for micro_step in range(grad_accum_steps):
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
-        grad_sync_context = nullcontext()
-        if dp_size > 1:
-            if args.data_parallel_type == 'ddp' and args.implementation == 'pytorch':
-                grad_sync_context = model.no_sync() if micro_step < grad_accum_steps - 1 else grad_sync_context
-            elif args.data_parallel_type == 'ddp' and args.implementation == 'custom':
-                model.set_require_backward_grad_sync(micro_step == grad_accum_steps - 1)
-        
-        with grad_sync_context:
-            with torch.autocast(device_type=device_type, dtype=torch.bfloat16 if HAS_BF16 else torch.float16):
-                logits = model(x)
-                if tp_size > 1 and args.enable_loss_parallelism:
-                    loss = vocab_parallel_cross_entropy_loss(logits, y, tp_group)
-                else:
-                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
-            # we have to scale the loss to account for gradient accumulation,
-            # because the gradients just add on each successive backward().
-            # addition of gradients corresponds to a SUM in the objective, but
-            # instead of a SUM we want MEAN. Scale the loss here so it comes out right
-            loss = loss / grad_accum_steps
-            loss_accum += loss.detach()
-            scaler.scale(loss).backward()
-    if dp_size > 1:
-        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG, group=dp_group)
-
-    if args.gradient_clipping:
-        scaler.unscale_(optimizer)
-        if is_distributed:
-            norm = clip_grad_norm(model, max_norm=1.0, tp_group=tp_group, dp_group=dp_group, dp_type=args.data_parallel_type)
-        # elif is_distributed and args.data_parallel_type == "fsdp":
-        #     norm = model.clip_grad_norm_(max_norm=1.0)
+    def _wrap_ddp(self, model):
+        """DDP wrapping, either custom or PyTorch."""
+        if self.args.implementation == "custom":
+            return CustomDDP(model.to(self.device), self.dp_group)
         else:
-            norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            return DDP(model.to(self.device), device_ids=[dist.get_rank(self.dp_group)])
+    
+    @staticmethod
+    def _get_param_dims(model):
+        param_dims = {}
+        for name, param in model.named_parameters():
+            param_dims[name] = param.dim()
+        return param_dims
 
-    # determine and set the learning rate for this iteration
-    lr = get_lr(step)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-    scaler.step(optimizer)
-    scaler.update()
-    if device_type == "cuda":
-        torch.cuda.synchronize() # wait for the GPU to finish work
-    t1 = time.time()
-    dt = t1 - t0 # time difference in seconds
-    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * distributed_world_size
-    tokens_per_sec = tokens_processed / dt
-    if master_process:
-        print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {f'{norm:.4f}' if args.gradient_clipping else None} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+    def _get_lr(self, step):
+        if step < self.warmup_steps:
+            return self.max_lr * (step + 1) / self.warmup_steps
+        if step > self.max_steps:
+            return self.min_lr
+        # Cosine decay
+        decay_ratio = (step - self.warmup_steps) / (self.max_steps - self.warmup_steps)
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+        return self.min_lr + coeff * (self.max_lr - self.min_lr)
 
-if is_distributed:
-    destroy_process_group()
+    def train(self):
+        """Main training loop."""
+        torch.set_float32_matmul_precision('high')
+        for step in range(self.max_steps):
+            t0 = time.time()
+            self.model.train()
+            self.optimizer.zero_grad()
+            loss_accum = 0.0
+
+            for micro_step in range(self.grad_accum_steps):
+                x, y = self.train_loader.next_batch()
+                x, y = x.to(self.device), y.to(self.device)
+                grad_sync_context = self._no_sync_context(micro_step)
+
+                with grad_sync_context:
+                    with torch.autocast(device_type=self.device_type, 
+                                        dtype=torch.bfloat16 if self.HAS_BF16 else torch.float16):
+                        logits = self.model(x)
+                        if self.tp_size > 1 and self.args.enable_loss_parallelism:
+                            loss = vocab_parallel_cross_entropy_loss(logits, y, self.tp_group)
+                        else:
+                            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+
+                    # average loss across micro-steps
+                    loss = loss / self.grad_accum_steps
+                    loss_accum += loss.detach()
+                    self.scaler.scale(loss).backward()
+
+            # Average the loss across DP ranks
+            if self.dp_size > 1:
+                dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG, group=self.dp_group)
+
+            # Optional gradient clipping
+            norm = None
+            if self.args.gradient_clipping:
+                self.scaler.unscale_(self.optimizer)
+                norm = self._clip_grad()
+
+            # Set LR and step the optimizer
+            lr = self._get_lr(step)
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = lr
+
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
+            # Timing / stats
+            if self.device_type == "cuda":
+                torch.cuda.synchronize()
+            dt = time.time() - t0
+            tokens_processed = (
+                self.train_loader.B 
+                * self.train_loader.T 
+                * self.grad_accum_steps 
+                * self.distributed_world_size
+            )
+            tokens_per_sec = tokens_processed / dt
+
+            if self.master_process:
+                print(
+                    f"step {step:5d} | loss: {loss_accum.item():.6f} | "
+                    f"lr {lr:.4e} | "
+                    f"norm: {f'{norm:.4f}' if self.args.gradient_clipping else None} | "
+                    f"dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}"
+                )
+
+        # Cleanup
+        if self.is_distributed:
+            destroy_process_group()
+
+    def _no_sync_context(self, micro_step):
+        """Return the right no_sync context for the current DP approach."""
+        if self.dp_size > 1 and self.args.data_parallel_type == 'ddp':
+            if self.args.implementation == 'pytorch':
+                if micro_step < self.grad_accum_steps - 1:
+                    return self.model.no_sync()
+            elif self.args.implementation == 'custom':
+                self.model.set_require_backward_grad_sync(micro_step == self.grad_accum_steps - 1)
+        return nullcontext()
+
+    def _clip_grad(self):
+        if self.is_distributed:
+            return clip_grad_norm(
+                self.model,
+                max_norm=1.0,
+                tp_group=self.tp_group,
+                dp_group=self.dp_group,
+                dp_type=self.args.data_parallel_type,
+            )
+        else:
+            return torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+
+
+def main():
+    trainer = Trainer()
+    trainer.train()
+
+
+if __name__ == "__main__":
+    main()
