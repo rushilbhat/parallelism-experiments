@@ -6,3 +6,4 @@ transformers
 datasets
 requests
 matplotlib
+tensorboard

@@ -25,6 +25,7 @@ from parallel.tensor_parallel import (
     apply_tensor_parallelism, 
     vocab_parallel_cross_entropy_loss
 )
+from torch.utils.tensorboard import SummaryWriter
 
 torch.use_deterministic_algorithms(True)
 
@@ -44,8 +45,10 @@ def parse_args(is_distributed):
         parser.add_argument('--deferred_init', action=argparse.BooleanOptionalAction, 
                             help="Delay materialisation of model parameters until sharding is applied")        
     parser.add_argument('--gradient_clipping', action=argparse.BooleanOptionalAction)
-    parser.add_argument('--eval_interval', type=int, default=10, 
+    parser.add_argument('--eval_interval', type=int, default=25, 
                         help='Interval between evaluations on validation set')
+    parser.add_argument('--dataset', type=str, default='tinyshakespeare',
+                        help='Choose dataset: tinyshakespeare or openwebtext')
     return parser.parse_args()
 
 
@@ -67,12 +70,22 @@ class Trainer:
         self.T = 1024   # sequence length
         self._compute_grad_accum_steps()
 
-        self.data_dir = 'data/'
+        self.data_dir = f'data/{self.args.dataset}'   
+        # Check if train and val bin files exist
+        train_path = os.path.join(self.data_dir, 'train.bin')
+        val_path = os.path.join(self.data_dir, 'val.bin')
+        if not os.path.exists(train_path):
+            raise FileNotFoundError(f"Training data not found at {train_path}. Run prepare.py in {self.data_dir} directory first.")
+        if not os.path.exists(val_path):
+            raise FileNotFoundError(f"Validation data not found at {val_path}. Run prepare.py in {self.data_dir} directory first.")
+
         self.eval_interval = self.args.eval_interval
-        self.eval_steps = []
-        self.eval_losses = []
-        self.train_losses = []
-        
+        if self.master_process:
+            log_dir = 'runs/'
+            for arg_name, arg_value in vars(self.args).items():
+                log_dir += f'{arg_name}={arg_value}_'
+            self.writer = SummaryWriter(log_dir=log_dir)
+
         self.model, self.param_dims = self._build_model()
 
         # Mixed-precision / BF16
@@ -98,7 +111,7 @@ class Trainer:
         self.max_lr = 6e-4
         self.min_lr = self.max_lr * 0.1
         self.warmup_steps = 10
-        self.max_steps = 50
+        self.max_steps = 250
 
     def _init_distributed(self):
         if self.is_distributed:
@@ -294,26 +307,6 @@ class Trainer:
         self.model.train()
         return val_loss
 
-    def plot_loss(self):
-        if not self.master_process:
-            return
-
-        os.makedirs('logs', exist_ok=True)
-            
-        plt.figure(figsize=(10, 6))
-        plt.plot(self.eval_steps, self.eval_losses, 'o-', label='Validation Loss')
-        plt.plot(range(self.max_steps), self.train_losses, 'o-', label='Training Loss')
-        plt.xlabel('Training Step')
-        plt.ylabel('Loss')
-        plt.title('Validation Loss vs. Training Steps')
-        plt.grid(True)
-        plt.legend()
-        
-        # Save the plot
-        plt.savefig(os.path.join('logs', 'validation_loss.png'))
-        if self.master_process:
-            print(f"Validation loss plot saved to validation_loss.png")
-
     def train(self):
         """Main training loop."""
         torch.set_float32_matmul_precision('high')
@@ -324,10 +317,9 @@ class Trainer:
             loss_accum = 0.0
 
             if step % self.eval_interval == 0:
-                val_loss = self.evaluate()
-                self.eval_steps.append(step)
-                self.eval_losses.append(val_loss.item())
+                val_loss = self.evaluate()        
                 if self.master_process:
+                    self.writer.add_scalar('Loss/val', val_loss.item(), step)
                     print(f"EVAL {step:5d} | val loss: {val_loss:.6f}")
 
             for micro_step in range(self.grad_accum_steps):
@@ -374,17 +366,19 @@ class Trainer:
             tokens_per_sec = tokens_processed / dt
 
             if self.master_process:
+                self.writer.add_scalar('Loss/train', loss_accum.item(), step)
+                if norm is not None: 
+                    self.writer.add_scalar('GradNorm/train', norm.item(), step)
                 print(
                     f"step {step:5d} | loss: {loss_accum.item():.6f} | "
                     f"lr {lr:.4e} | "
                     f"norm: {f'{norm:.4f}' if self.args.gradient_clipping else None} | "
                     f"dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}"
                 )
-                self.train_losses.append(loss_accum.item())
-
-        self.plot_loss()
 
         # Cleanup
+        if self.master_process:
+            self.writer.close()
         if self.is_distributed:
             destroy_process_group()
 
