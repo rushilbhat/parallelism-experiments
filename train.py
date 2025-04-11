@@ -8,7 +8,6 @@ import torch
 import torch.nn.functional as F
 import argparse
 import functools
-import matplotlib.pyplot as plt
 import numpy as np
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -47,8 +46,8 @@ def parse_args(is_distributed):
     parser.add_argument('--gradient_clipping', action=argparse.BooleanOptionalAction)
     parser.add_argument('--eval_interval', type=int, default=25, 
                         help='Interval between evaluations on validation set')
-    parser.add_argument('--dataset', type=str, default='tinyshakespeare',
-                        help='Choose dataset: tinyshakespeare or openwebtext')
+    parser.add_argument('--dataset', type=str, default='shakespeare',
+                        help='Choose dataset: shakespeare or openwebtext')
     return parser.parse_args()
 
 
@@ -295,14 +294,11 @@ class Trainer:
                         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
                     losses[k] = loss.item()
         
-        # Average the loss
         val_loss = losses.mean()
         
         # Average across distributed processes if using DP
         if self.dp_size > 1:
-            # val_loss_tensor = torch.tensor([val_loss], device=self.device)
             dist.all_reduce(val_loss, op=dist.ReduceOp.AVG, group=self.dp_group)
-            # val_loss = val_loss_tensor.item()
             
         self.model.train()
         return val_loss
@@ -335,7 +331,7 @@ class Trainer:
                         else:
                             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
 
-                    # average loss across micro-steps
+                    # Average loss across micro-steps
                     loss = loss / self.grad_accum_steps
                     loss_accum += loss.detach()
                     self.scaler.scale(loss).backward()
