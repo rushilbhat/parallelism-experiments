@@ -31,12 +31,10 @@ Before training, you need to prepare the dataset:
 
 ```bash
 # For Shakespeare dataset (small, prepares quickly)
-cd data/shakespeare
-python prepare.py
+python data/shakespeare/prepare.py
 
 # For OpenWebText dataset (large, takes 20-30 minutes)
-cd data/openwebtext
-python prepare.py
+python data/openwebtext/prepare.py
 ```
 
 The Shakespeare dataset is a toy dataset whose train and validation splits are generated instantly. OpenWebText is a heavy-duty dataset that takes approximately 20-30 minutes to create.
