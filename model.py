@@ -1,3 +1,7 @@
+# This file is sourced from the nanoGPT repository by Andrej Karpathy
+# GitHub: https://github.com/karpathy/build-nanogpt
+# It is not a contribution of this project.
+
 # model.py
 import inspect
 from dataclasses import dataclass

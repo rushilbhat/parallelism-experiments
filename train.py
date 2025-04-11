@@ -38,9 +38,9 @@ def parse_args(is_distributed):
         parser.add_argument('--data_parallel_size', type=int, default=1, 
                             help='Degree of data parallelism')
         parser.add_argument('--data_parallel_type', type=str, choices=['ddp', 'fsdp'], 
-                            help='Choose data parallelization strategy: ddp or fsdp')
-        parser.add_argument('--implementation', type=str, choices=['pytorch', 'custom'], 
-                            help='Choose distributed implementation: pytorch or custom')
+                            help='Choose data parallelisation strategy: ddp or fsdp')
+        parser.add_argument('--implementation', type=str, choices=['custom', 'pytorch'], 
+                            help='Choose distributed implementation: custom or pytorch')
         parser.add_argument('--deferred_init', action=argparse.BooleanOptionalAction, 
                             help="Delay materialisation of model parameters until sharding is applied")        
     parser.add_argument('--gradient_clipping', action=argparse.BooleanOptionalAction)

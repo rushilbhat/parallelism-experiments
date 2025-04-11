@@ -1,3 +1,7 @@
+# This script is sourced from the nanoGPT repository by Andrej Karpathy
+# GitHub: https://github.com/karpathy/nanoGPT
+# It is not a contribution of this project.
+
 # saves the openwebtext dataset to a binary file for training. following was helpful:
 # https://github.com/HazyResearch/flash-attention/blob/main/training/src/datamodules/language_modeling_hf.py
 

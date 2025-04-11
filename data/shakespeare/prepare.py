@@ -1,3 +1,7 @@
+# This script is sourced from the nanoGPT repository by Andrej Karpathy
+# GitHub: https://github.com/karpathy/nanoGPT
+# It is not a contribution of this project.
+
 import os
 import requests
 import tiktoken
