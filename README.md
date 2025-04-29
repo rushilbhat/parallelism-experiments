@@ -39,15 +39,7 @@ python data/openwebtext/prepare.py
 
 The Shakespeare dataset is a toy dataset whose train and validation splits are generated instantly. OpenWebText is a heavy-duty dataset that takes approximately 20-30 minutes to create.
 
-## Training 
-
-For distributed training, use `torchrun` to launch the training script across multiple GPUs:
-
-```bash
-torchrun --standalone --nproc_per_node=N train.py [args]
-```
-
-Where N is the number of GPUs to use.
+## Training
 
 ### Training Arguments
 
@@ -63,83 +55,35 @@ Where N is the number of GPUs to use.
 | `--eval_interval` | Interval between evaluations on validation set (default: 25) |
 | `--dataset` | Choose dataset: shakespeare or openwebtext (default: shakespeare) |
 
-### Example Commands
+### Launch Command
 
-#### Single Parallelism
+For distributed training, use `torchrun` to launch the training script across multiple GPUs:
 
-**Data Parallel (DDP) with 2 GPUs**:
 ```bash
-torchrun --standalone --nproc_per_node=2 train.py --data_parallel_size=2 --data_parallel_type=ddp --implementation=custom --gradient_clipping
+torchrun --standalone --nproc_per_node=N train.py [arguments]
 ```
+Example configurations:
+| Configuration          | Arguments                                                                 |
+|------------------------|---------------------------------------------------------------------------|
+| DDP (2 GPUs)           | `--data_parallel_size=2 --data_parallel_type=ddp --implementation=custom` |
+| FSDP (2 GPUs)          | `--data_parallel_size=2 --data_parallel_type=fsdp --implementation=custom --deferred_init` |
+| TP (2 GPUs)            | `--tensor_parallel_size=2 --enable_loss_parallelism`                      |
+| FSDP + TP (8 GPUs)     | `--tensor_parallel_size=2 --data_parallel_size=4 --data_parallel_type=fsdp --deferred_init --dataset=openwebtext` |
 
-**Fully Sharded Data Parallel (FSDP) with 2 GPUs**:
-```bash
-torchrun --standalone --nproc_per_node=2 train.py --data_parallel_size=2 --data_parallel_type=fsdp --implementation=custom --deferred_init --gradient_clipping
-```
-
-**Tensor Parallel (TP) with 2 GPUs**:
-```bash
-torchrun --standalone --nproc_per_node=2 train.py --tensor_parallel_size=2 --enable_loss_parallelism --gradient_clipping
-```
-
-#### 2D Parallelism (requires at least 4 GPUs)
-
-**DDP + TP with 4 GPUs (2x2)**:
-```bash
-torchrun --standalone --nproc_per_node=4 train.py --tensor_parallel_size=2 --data_parallel_size=2 --data_parallel_type=ddp --implementation=custom --enable_loss_parallelism --gradient_clipping
-```
-
-**FSDP + TP with 4 GPUs (2x2)**:
-```bash
-torchrun --standalone --nproc_per_node=4 train.py --tensor_parallel_size=2 --data_parallel_size=2 --data_parallel_type=fsdp --implementation=custom --enable_loss_parallelism --deferred_init --gradient_clipping
-```
-
-**Large-scale configuration for 8 GPUs (4x2)**:
-```bash
-torchrun --standalone --nproc_per_node=8 train.py --tensor_parallel_size=2 --data_parallel_size=4 --data_parallel_type=fsdp --implementation=custom --enable_loss_parallelism --deferred_init --gradient_clipping --dataset=openwebtext
-```
 
 ## Running Tests
 
-The repository includes unit tests for each parallelism implementation. Tests are designed to run on 2 GPUs.
-
-To run the tests:
+Unit tests are included for each parallelism implementation and are designed to run on 2 GPUs. To run a specific test:
 
 ```bash
-# Run tests for a specific file
 torchrun --standalone --nproc_per_node=2 -m unittest tests/[filename]
-
-# Examples:
-# Test DDP implementation
-torchrun --standalone --nproc_per_node=2 -m unittest tests/test_ddp.py
-
-# Test FSDP implementation
-torchrun --standalone --nproc_per_node=2 -m unittest tests/test_fsdp.py
-
-# Test TP implementation
-torchrun --standalone --nproc_per_node=2 -m unittest tests/test_tp.py
 ```
 
-Each test file validates the corresponding parallelism strategy:
-- `test_ddp.py`: Tests custom DDP implementation against PyTorch's native DDP
-- `test_fsdp.py`: Tests custom FSDP implementation against PyTorch's native FSDP
-- `test_tp.py`: Tests tensor parallelism implementations including sharding consistency and numerical correctness
+### Available Test Files
 
-## Architecture
-
-The repository is organised as follows:
-
-- `model.py`: Implementation of GPT model
-- `train.py`: Main training script with Trainer class
-- `parallel/`: Implementations of parallelism techniques
-  - `ddp.py`: Custom DDP implementation
-  - `fsdp.py`: Custom FSDP implementation
-  - `tensor_parallel.py`: Tensor parallelism implementation
-  - `utils.py`: Utility functions for distributed training
-- `data/`: Dataset preparation scripts
-  - `shakespeare/`: Shakespeare dataset
-  - `openwebtext/`: OpenWebText dataset
-- `tests/`: Unit tests for different parallelism implementations
+- `test_ddp.py` – Tests custom DDP vs PyTorch DDP
+- `test_fsdp.py` – Tests custom FSDP vs PyTorch FSDP
+- `test_tp.py` – Tests sharding consistency and numerical correctness of tensor parallelism 
 
 ## TensorBoard Logging
 
@@ -159,15 +103,6 @@ ssh -L 6006:localhost:6006 user@remote-server
 ```
 http://localhost:6006
 ```
-
-## Performance Monitoring
-
-The training script logs performance metrics including:
-- Training loss
-- Validation loss 
-- Tokens per second
-- Gradient norms (if gradient clipping is enabled)
-- Learning rates
 
 ## Notes
 
