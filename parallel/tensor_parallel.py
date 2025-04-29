@@ -52,13 +52,9 @@ class ColParallelLinear(nn.Linear):
         if x._backward_hooks is None and x.requires_grad:
             x.register_hook(lambda grad: dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=self.tp_group))
 
-        local_output = F.linear(x, self.weight, self.bias)
-
+        out = F.linear(x, self.weight, self.bias)
         if self.gather_output:
-            out = DifferentiableAllGather.apply(local_output, self.tp_group)
-        else:
-            out = local_output
-
+            out = DifferentiableAllGather.apply(out, self.tp_group)
         return out
 
 
@@ -80,15 +76,12 @@ class RowParallelLinear(nn.Linear):
             self.bias.data.copy_(unsharded_mod.bias.data)
 
     def forward(self, x: torch.Tensor):
-        local_output = F.linear(x, self.weight)
-
+        out = F.linear(x, self.weight)
         if self.reduce_output:
-            local_output = DifferentiableAllReduce.apply(local_output, self.tp_group)
-
+            out = DifferentiableAllReduce.apply(out, self.tp_group)
         if self.bias is not None:
-            local_output = local_output + self.bias
-
-        return local_output
+            out = out + self.bias
+        return out
 
 class VocabParallelEmbedding(nn.Embedding):
     def __init__(self, num_embeddings, embedding_dim, device, dtype, tp_group):
@@ -106,17 +99,16 @@ class VocabParallelEmbedding(nn.Embedding):
         self.weight.data.copy_(unsharded_mod.weight.data[self.vocab_start_idx:self.vocab_end_idx])
 
     def forward(self, input_ids):
-        local_mask = (input_ids >= self.vocab_start_idx) & (input_ids < self.vocab_end_idx)    
+        mask = (input_ids >= self.vocab_start_idx) & (input_ids < self.vocab_end_idx)    
         local_ids = input_ids - self.vocab_start_idx
         clamped_local_ids = torch.clamp(local_ids, 0, self.local_num_embeddings - 1)
-        local_output = super().forward(clamped_local_ids)
-        local_output = local_output * local_mask.float().unsqueeze(-1)
-        
-        local_output = DifferentiableAllReduce.apply(local_output, self.tp_group)
 
-        return local_output
+        out = super().forward(clamped_local_ids)
+        out = out * mask.float().unsqueeze(-1)
+        out = DifferentiableAllReduce.apply(out, self.tp_group)
+        return out
 
-def vocab_parallel_cross_entropy_loss(logits, targets, tp_group, ignore_index=-100):
+def vocab_parallel_cross_entropy_loss(logits, targets, tp_group):
     # local_logits: (B, T, V_local)
     # targets: (B, T) full target indices in [0, V)
     # vocab_start, vocab_end: the range of token indices on this rank
@@ -136,13 +128,13 @@ def vocab_parallel_cross_entropy_loss(logits, targets, tp_group, ignore_index=-1
     global_sum = DifferentiableAllReduce.apply(local_sum, tp_group)
     logsumexp = torch.log(global_sum)
 
-    local_mask = (targets >= vocab_start_idx) & (targets < vocab_end_idx) #& ignore_mask
+    mask = (targets >= vocab_start_idx) & (targets < vocab_end_idx)
 
     local_targets = targets - vocab_start_idx
     local_targets = local_targets.clamp(0, local_vocab_size - 1)
 
     pred_logits = torch.gather(logits, dim=-1, index=local_targets.unsqueeze(-1)).squeeze(-1)
-    pred_logits = pred_logits * local_mask.float()
+    pred_logits = pred_logits * mask.float()
     avg_pred_logit = pred_logits.mean()
     avg_logsumexp = logsumexp.mean()
     avg_pred_logit = DifferentiableAllReduce.apply(avg_pred_logit, tp_group)
