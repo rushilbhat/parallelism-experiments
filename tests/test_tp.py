@@ -257,7 +257,7 @@ class TestTP(BaseDistributedTest):
         ref = local_t.detach().clone()
         dist.all_reduce(ref, op=dist.ReduceOp.SUM, group=dist.group.WORLD)
 
-        reduced = DifferentiableAllReduce.apply(local_t, 'sum', dist.group.WORLD)
+        reduced = DifferentiableAllReduce.apply(local_t, dist.group.WORLD)
 
         self.assertTrue(torch.equal(ref, reduced))
 
