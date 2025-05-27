@@ -64,7 +64,7 @@ class CustomFSDP(nn.Module):
                 offset += numel
         else:
             self._materialise_params()
-            self._update_module_params(flag=True)
+            self._update_module_params()
 
             def _apply_param_init_fn(root_module, param_init_fn):
                 queue = deque([root_module])
@@ -93,7 +93,7 @@ class CustomFSDP(nn.Module):
         for name in self.param_names:
             _replace_param(name, nn.Parameter(torch.empty(0, device='cuda')))
             
-    def _update_module_params(self, include_grads=False, flag=False):
+    def _update_module_params(self, include_grads=False):
         is_sharded = self.flat_param.data_ptr() == self.local_shard.data_ptr()
         local_shard_size = self.local_shard.numel()
         offset = 0 - local_shard_size * self.rank if is_sharded else 0
