@@ -122,11 +122,11 @@ def vocab_parallel_cross_entropy_loss(logits, targets, tp_group):
         max_logits, _ = torch.max(logits, dim=-1, keepdim=True)
         dist.all_reduce(max_logits, op=dist.ReduceOp.MAX, group=tp_group)
 
-    logits = logits - max_logits
-    exp_logits = torch.exp(logits)
-    local_sum = exp_logits.sum(dim=-1)
+    shifted_logits = logits - max_logits
+    exp_logits = torch.exp(shifted_logits)
+    local_sum = exp_logits.sum(dim=-1, keepdim=True)
     global_sum = DifferentiableAllReduce.apply(local_sum, tp_group)
-    logsumexp = torch.log(global_sum)
+    logsumexp = max_logits + torch.log(global_sum) 
 
     mask = (targets >= vocab_start_idx) & (targets < vocab_end_idx)
 
@@ -136,7 +136,7 @@ def vocab_parallel_cross_entropy_loss(logits, targets, tp_group):
     pred_logits = torch.gather(logits, dim=-1, index=local_targets.unsqueeze(-1)).squeeze(-1)
     pred_logits = pred_logits * mask.float()
     avg_pred_logit = pred_logits.mean()
-    avg_logsumexp = logsumexp.mean()
+    avg_logsumexp = logsumexp.mean().squeeze(-1)
     avg_pred_logit = DifferentiableAllReduce.apply(avg_pred_logit, tp_group)
     avg_nll_loss = avg_logsumexp - avg_pred_logit
 
